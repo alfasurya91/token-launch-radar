@@ -35,8 +35,22 @@
     var age = row.age_days == null ? MODEL.unknown_age_days : row.age_days;
     return MODEL.maturity_floor + (clamp(age, 0, MODEL.maturity_days) / MODEL.maturity_days) * maturityRange;
   }
+  function sizeOf(row, sizeExponent) {
+    var ref = DATA.size_reference_tvl > 0 ? DATA.size_reference_tvl : 1;
+    return Math.pow(row.tvl_usd / ref, sizeExponent);
+  }
   function impliedOf(row, sb) {
-    var peer = row.peer_multiple * (sb ? sb.peerScale : 1);
+    // Without the sandbox the page uses the row's own peer multiple, the one board.json carries,
+    // so the recomputation lands on the same dollar. With the sandbox it rebuilds the multiple
+    // from the row's peer median and size factor, under the changed constants.
+    var peer;
+    if (sb) {
+      var median = row.size_multiplier ? row.peer_multiple / row.size_multiplier : row.peer_multiple;
+      peer = median * sizeOf(row, sb.sizeExponent) * sb.peerScale;
+      peer = Math.min(MODEL.peer_cap, Math.max(MODEL.peer_floor, peer));
+    } else {
+      peer = row.peer_multiple;
+    }
     var g = growthOf(row, sb ? sb.growthWeight : MODEL.growth_weight);
     var m = maturityOf(row, sb ? sb.maturityRange : MODEL.maturity_range);
     return Math.max(1, Math.round(row.tvl_usd * peer * g * m));
@@ -83,19 +97,70 @@
     if (c.indexOf('basis') >= 0) return 'Deposit $' + capital + ' of USDC into ' + name + '\'s basis position on ' + chain + ' and keep it open.';
     return 'Deposit $' + capital + ' of USDC into ' + name + ' on ' + chain + ' and keep the position open.';
   }
+  function hasAny(c, needles) {
+    for (var i = 0; i < needles.length; i++) if (c.indexOf(needles[i]) >= 0) return true;
+    return false;
+  }
+  function weeklyActionFor(row, chain) {
+    var c = (row.category || '').toLowerCase();
+    var name = row.name;
+    if (hasAny(c, ['lend', 'cdp', 'collateral'])) return 'Supply or borrow once a week, and repay or top up the position on ' + name + ' so it stays active.';
+    if (hasAny(c, ['dex', 'yield', 'leveraged farm'])) return 'Swap or add liquidity once a week on ' + name + ' so the position records activity.';
+    if (hasAny(c, ['bridge'])) return 'Bridge a small amount once a week through ' + name + ' and use the bridged funds in its app.';
+    if (hasAny(c, ['staking', 'restak'])) return 'Restake or claim rewards once a week through ' + name + ' and keep the receipt.';
+    if (hasAny(c, ['perpetual', 'derivative'])) return 'Open or close one small hedged position once a week on ' + name + '.';
+    if (hasAny(c, ['prediction'])) return 'Place one small market position a week on ' + name + '.';
+    if (hasAny(c, ['curator', 'allocator', 'risk'])) return 'Deposit into a new ' + name + ' vault, or rebalance between vaults, once a week.';
+    if (hasAny(c, ['stable'])) return 'Mint or redeem the stable asset once a week through ' + name + ' on ' + chain + '.';
+    if (hasAny(c, ['rwa'])) return "Check " + name + "'s new listings once a week and hold the yield asset.";
+    if (hasAny(c, ['insurance'])) return 'Renew or adjust the cover once a week through ' + name + '.';
+    if (hasAny(c, ['basis'])) return 'Check the basis position on ' + name + ' once a week and top it up when the spread widens.';
+    return 'Make one qualifying action each week on ' + name + ', such as a deposit, a borrow, a swap or a vote.';
+  }
+  function milestoneFor(row) {
+    var c = (row.category || '').toLowerCase();
+    if (hasAny(c, ['lend', 'cdp', 'collateral'])) return 'a launch is usually preceded by a new market listing or an interest-rate vote';
+    if (hasAny(c, ['dex'])) return 'a launch is usually preceded by a new pool or a fee vote';
+    if (hasAny(c, ['curator', 'allocator', 'risk'])) return 'a launch is usually preceded by a new vault or a new curator onboarding';
+    if (hasAny(c, ['rwa'])) return 'a launch is usually preceded by a new asset listing';
+    if (hasAny(c, ['stable'])) return 'a launch is usually preceded by a new collateral type or a peg-mechanism vote';
+    if (hasAny(c, ['perpetual', 'derivative'])) return 'a launch is usually preceded by a new market listing';
+    if (hasAny(c, ['prediction'])) return 'a launch is usually preceded by a new market category';
+    if (hasAny(c, ['bridge'])) return 'a launch is usually preceded by a new route or a fee change';
+    if (hasAny(c, ['staking', 'restak'])) return 'a launch is usually preceded by a new staking asset or a rewards change';
+    if (hasAny(c, ['basis'])) return 'a launch is usually preceded by a new market listing or a new basis strategy';
+    if (hasAny(c, ['yield', 'leveraged farm', 'farm'])) return 'a launch is usually preceded by a new vault or a new yield strategy';
+    return 'a launch is usually preceded by a points snapshot or a governance post';
+  }
+  function positionFor(row) {
+    var c = (row.category || '').toLowerCase();
+    if (hasAny(c, ['lend', 'cdp', 'collateral'])) return 'a small supply position';
+    if (hasAny(c, ['dex', 'yield', 'leveraged farm'])) return 'a small liquidity position';
+    if (hasAny(c, ['staking', 'restak'])) return 'a small staked position';
+    if (hasAny(c, ['perpetual', 'derivative'])) return 'a small margin position';
+    if (hasAny(c, ['curator', 'allocator', 'risk'])) return 'a small vault position';
+    if (hasAny(c, ['stable'])) return 'a small stable-asset position';
+    if (hasAny(c, ['rwa'])) return 'a small yield-asset position';
+    if (hasAny(c, ['insurance'])) return 'a small cover position';
+    if (hasAny(c, ['basis'])) return 'a small basis position';
+    return 'a small position';
+  }
   function farmSteps(row) {
     var chain = chainOf(row);
     var capital = capitalFor(row);
     var hold = holdDaysFor(row.age_days);
     var gas = gasFor(chain);
+    var weekly = weeklyActionFor(row, chain);
+    var milestone = milestoneFor(row);
+    var position = positionFor(row);
     return [
-      { text: 'Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
+      { text: 'Use a fresh wallet on ' + chain + ' that holds only the funds you plan to farm, and keep its seed phrase offline.', cost: 'under $3 of gas for the first transaction', time: '5 minutes' },
       { text: actionFor(row, capital, chain), cost: '$' + capital + ' of capital and ' + gas, time: '15 minutes to set up' },
-      { text: 'Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.', cost: gas + ' a week', time: '10 minutes a week' },
+      { text: weekly, cost: gas + ' a week', time: '10 minutes a week' },
       { text: 'Hold the position for at least ' + hold + ' days so the activity is counted in more than one snapshot.', cost: 'the $' + capital + ' stays in the position', time: hold + ' days' },
-      { text: 'Open the protocol\'s own points or rewards page and check whether it runs one; claim only from the link that page publishes, and never pay to claim.', cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
-      { text: 'Check the protocol\'s announcements once a week: a launch is usually preceded by a points snapshot or a governance post, and the position must be open when it lands.', cost: 'nothing but the check', time: '5 minutes a week' },
-      { text: 'Write the wallet, the dates and every transaction in a farm log; when you unwind, withdraw in tranches and keep a small position until any claim window has closed.', cost: gas + ' to exit', time: '10 minutes to unwind' },
+      { text: "Open the protocol's own points or rewards page and check whether it runs one; claim only from the link that page publishes, and never pay to claim.", cost: 'no fee to check, and never pay to claim', time: '10 minutes' },
+      { text: 'Check the protocol\'s announcements once a week: ' + milestone + ', and the position must be open when it lands.', cost: 'nothing but the check', time: '5 minutes a week' },
+      { text: 'Write the wallet, the dates and every transaction in a farm log; when you unwind, withdraw in tranches and keep ' + position + ' until any claim window has closed.', cost: gas + ' to exit', time: '10 minutes to unwind' },
     ];
   }
 
@@ -120,9 +185,9 @@
     return s;
   }
   var state = readHash();
-  var sandbox = { peerScale: 1, growthWeight: MODEL.growth_weight, maturityRange: MODEL.maturity_range };
+  var sandbox = { peerScale: 1, growthWeight: MODEL.growth_weight, maturityRange: MODEL.maturity_range, sizeExponent: MODEL.size_exponent };
   function sandboxActive() {
-    return sandbox.peerScale !== 1 || sandbox.growthWeight !== MODEL.growth_weight || sandbox.maturityRange !== MODEL.maturity_range;
+    return sandbox.peerScale !== 1 || sandbox.growthWeight !== MODEL.growth_weight || sandbox.maturityRange !== MODEL.maturity_range || sandbox.sizeExponent !== MODEL.size_exponent;
   }
   function writeHash() {
     var parts = [];
@@ -194,9 +259,10 @@
       '<button class="close" type="button" data-close>Close</button></div>' +
       '<div class="detail-section"><h3>Implied value: ' + fmtUsd(row.implied_value_usd) + '</h3>' +
       '<div class="equation"><div><span>TVL</span><b>' + fmtUsd(row.tvl_usd) + '</b></div>' +
-      '<div><span>Peer multiple × growth × maturity</span><b>' + row.peer_multiple.toFixed(4) + ' × ' + growthOf(row, MODEL.growth_weight).toFixed(3) + ' × ' + maturityOf(row, MODEL.maturity_range).toFixed(3) + '</b></div>' +
+      '<div><span>Peer median × size</span><b>' + row.peer_median.toFixed(4) + ' × ' + row.size_multiplier.toFixed(3) + ' = ' + row.peer_multiple.toFixed(4) + '</b></div>' +
+      '<div><span>Growth × maturity</span><b>' + growthOf(row, MODEL.growth_weight).toFixed(3) + ' × ' + maturityOf(row, MODEL.maturity_range).toFixed(3) + '</b></div>' +
       '<div><span>Age with no token</span><b>' + ageLabel(row.age_days) + '</b></div></div>' +
-      '<p class="sub">The peer multiple is ' + esc(peer) + ', clamped to 0.05–1.00. Growth is ' + fmtPct(row.change_7d) + ' over 7 days, clamped to −50…+100% and half-weighted. Maturity rises with age to 730 days; a protocol with no listing date is priced at 365 days.</p>' +
+      '<p class="sub">The peer multiple is ' + esc(peer) + ', priced at the reference size of ' + fmtUsd(DATA.size_reference_tvl) + ' of TVL and then adjusted for this protocol\'s size: ' + fmtUsd(row.tvl_usd) + ' of TVL trades at ×' + row.size_multiplier.toFixed(3) + ' of the reference multiple, because the snapshot\'s live peers show the multiple falls as TVL rises (fitted −0.54 per log point of TVL). Growth is ' + fmtPct(row.change_7d) + ' over 7 days, clamped to −50…+100% and weighted 0.10 — the week\'s deposits are already inside TVL. Maturity rises with age to 730 days, from 0.90 to 1.00; a protocol with no listing date is priced at 365 days. The multiple is clamped to 0.01–1.00.</p>' +
       (recomputed === row.implied_value_usd
         ? '<p class="sub">The dashboard recomputed this value from the snapshot\'s own figures and landed on the same dollar board.json carries.</p>'
         : '<p class="sub">The dashboard recomputed ' + fmtUsd(recomputed) + ' from the snapshot\'s own figures; board.json carries ' + fmtUsd(row.implied_value_usd) + '. The two should agree.</p>') +
@@ -248,7 +314,7 @@
         '<td class="num">' + fmtUsd(r.tvl_usd) + '</td>' +
         '<td class="num ' + (g == null ? '' : g >= 0 ? 'pos' : 'neg') + '">' + fmtPct(g) + '</td>' +
         '<td class="num">' + ageLabel(r.age_days) + '</td>' +
-        '<td class="num">' + r.peer_multiple.toFixed(2) + '<br><span class="sub">' + (r.peer_from_category ? r.peer_count + ' peers' : 'market') + '</span></td>' +
+        '<td class="num">' + r.peer_multiple.toFixed(2) + '<br><span class="sub">' + (r.peer_from_category ? r.peer_count + ' peers' : 'market') + ' · ×' + r.size_multiplier.toFixed(2) + '</span></td>' +
         '<td class="implied"><div class="bar"><i style="width:' + Math.max(2, Math.round(it.value / max * 100)) + '%"></i></div><b>' + fmtUsd(it.value) + '</b>' + (sb ? ' <span class="sub">sandbox</span>' : '') + '</td>' +
         '<td><span class="status hot">pre-token</span></td></tr>';
     }).join('');
@@ -266,15 +332,18 @@
       return '<tr><td>' + esc(p.category) + '</td><td class="num">' + p.entry.n + '</td><td class="num">' + p.entry.multiple.toFixed(4) + '</td><td>' + (p.entry.from_category ? 'category peers' : 'market-wide median') + '</td></tr>';
     }).join('');
     return '<section class="panel model" aria-label="The model"><h2>The model: worth what its peers trade for</h2>' +
-      '<p>Each category is priced at the median market-cap / TVL of its live-token peers, when the category has at least five live peers; otherwise the market-wide median. The multiple is clamped to 0.05–1.00, so no launch is priced above its own TVL on a market-cap basis and no category is priced on one thin outlier. Growth and age then scale the base: a growing protocol is worth more, and a protocol that has held its TVL for years with no token is worth more than one listed last month.</p>' +
-      '<p class="formula">implied = TVL × peer&nbsp;&nbsp;×&nbsp;&nbsp;(1 + clamp(7d, −50, 100) / 100 × ' + MODEL.growth_weight + ')&nbsp;&nbsp;×&nbsp;&nbsp;(0.7 + min(age, 730) / 730 × 0.3)</p>' +
+      '<p>Each category is priced at the median market-cap / TVL of its live-token peers, when the category has at least five live peers; otherwise the market-wide median. That median is the multiple at the reference size of ' + fmtUsd(DATA.size_reference_tvl) + ' of TVL, and it is then adjusted for the protocol\'s own size: the multiple falls as TVL rises, so a protocol ten times larger trades at about 0.29× the multiple. The multiple is clamped to 0.01–1.00, so no launch is priced above its own TVL on a market-cap basis and no category is priced on one thin outlier.</p>' +
+      '<p>Why the size term: across the snapshot\'s 128 live-token peers, log(market-cap / TVL) falls 0.54 per log point of TVL (t = −5.2), and the same slope holds within categories and after dropping the largest protocols. Growth and age show no reliable premium in the same fit — a growing TVL does not raise the multiple, because the week\'s deposits are already inside TVL, and age shows no effect at all — so they move the value only a little: growth is weighted 0.10, maturity rises from 0.90 to 1.00 over 730 days.</p>' +
+      '<p class="formula">implied = TVL × peer × size&nbsp;&nbsp;×&nbsp;&nbsp;(1 + clamp(7d, −50, 100) / 100 × ' + MODEL.growth_weight + ')&nbsp;&nbsp;×&nbsp;&nbsp;(0.90 + min(age, 730) / 730 × ' + MODEL.maturity_range + ')</p>' +
+      '<p class="sub">peer × size = the category median × (TVL / ' + fmtUsd(DATA.size_reference_tvl) + ')^(' + MODEL.size_exponent + ').</p>' +
       '<table class="peer-table"><thead><tr><th>Category</th><th class="num">Live peers</th><th class="num">Multiple</th><th>Priced on</th></tr></thead><tbody>' + rows + '</tbody></table>' +
-      '<p class="sub">Market-wide median mcap / TVL: ' + DATA.overall_peer_multiple.toFixed(4) + '. ' + DATA.board_size + ' protocols ranked; ' + DATA.watchlist_size + ' on the watchlist, all covered; ' + DATA.early_size + ' more below the $' + (DATA.floor_usd / 1e6) + 'M floor. Live-token protocols are set aside and shown as the market\'s own values, never mixed into the ranking.</p>' +
+      '<p class="sub">The multiples above are the multiple at the reference size of ' + fmtUsd(DATA.size_reference_tvl) + ' of TVL; the board applies the size adjustment per protocol. Market-wide median mcap / TVL: ' + DATA.overall_peer_multiple.toFixed(4) + '. ' + DATA.board_size + ' protocols ranked; ' + DATA.watchlist_size + ' on the watchlist, all covered; ' + DATA.early_size + ' more below the $' + (DATA.floor_usd / 1e6) + 'M floor. Live-token protocols are set aside and shown as the market\'s own values, never mixed into the ranking.</p>' +
       '<div class="sandbox"><h3>Model sandbox</h3><p>Change the constants and watch the board re-rank. This only changes the view in this page; the submitted board is the one main.ts wrote with the constants above.</p>' +
       '<div class="sliders">' +
       '<div><label for="sb-peer">Peer multiple scale: <output id="sb-peer-out">' + sandbox.peerScale.toFixed(2) + '×</output></label><input id="sb-peer" type="range" min="0.5" max="2" step="0.05" value="' + sandbox.peerScale + '"></div>' +
       '<div><label for="sb-growth">Growth weight: <output id="sb-growth-out">' + sandbox.growthWeight.toFixed(2) + '</output></label><input id="sb-growth" type="range" min="0" max="1" step="0.05" value="' + sandbox.growthWeight + '"></div>' +
       '<div><label for="sb-maturity">Maturity range: <output id="sb-maturity-out">' + sandbox.maturityRange.toFixed(2) + '</output></label><input id="sb-maturity" type="range" min="0" max="0.6" step="0.05" value="' + sandbox.maturityRange + '"></div>' +
+      '<div><label for="sb-size">Size exponent: <output id="sb-size-out">' + sandbox.sizeExponent.toFixed(2) + '</output></label><input id="sb-size" type="range" min="-1" max="0" step="0.05" value="' + sandbox.sizeExponent + '"></div>' +
       '</div></div></section>';
   }
 
@@ -286,7 +355,7 @@
       '<header class="top"><div class="brand"><span class="mark" aria-hidden="true"></span>Token Radar</div>' +
       '<div class="top-meta"><span>Snapshot ' + esc(DATA.as_of) + '</span><span>Model ' + esc(DATA.model_version) + '</span><span>' + DATA.board_size + ' rows</span></div></header>' +
       '<section class="lede"><h1>The protocols with no token yet, ranked by what a launch would be worth</h1>' +
-      '<p>One sealed DefiLlama snapshot, ' + DATA.board_size + ' pre-token protocols, each priced like its live-token peers. The watchlist is the floor, never the ceiling: every watchlist protocol is here, and so is every other pre-token protocol the rule would rank. Click a row for the model behind its number and a plan to farm it.</p>' +
+      '<p>One sealed DefiLlama snapshot, ' + DATA.board_size + ' pre-token protocols, each priced like its live-token peers, adjusted for size: the bigger the protocol, the lower the multiple the market pays. The watchlist is the floor, never the ceiling: every watchlist protocol is here, and so is every other pre-token protocol the rule would rank. Click a row for the model behind its number and a plan to farm it.</p>' +
       '<div class="facts">' +
       '<div class="fact"><span>Watchlist covered</span><b>' + wlCount + ' / ' + DATA.watchlist_size + '</b></div>' +
       '<div class="fact"><span>Protocols ranked</span><b>' + DATA.board_size + '</b></div>' +
@@ -336,7 +405,7 @@
     if (clear) clear.addEventListener('click', function () { state.q = ''; state.category = ''; state.chain = ''; state.wl = false; writeHash(); render(); });
     var reset = mount.querySelector('[data-reset-sandbox]');
     if (reset) reset.addEventListener('click', function () {
-      sandbox = { peerScale: 1, growthWeight: MODEL.growth_weight, maturityRange: MODEL.maturity_range };
+      sandbox = { peerScale: 1, growthWeight: MODEL.growth_weight, maturityRange: MODEL.maturity_range, sizeExponent: MODEL.size_exponent };
       render();
     });
     mount.querySelectorAll('.sliders input[type="range"]').forEach(function (input) {
@@ -344,8 +413,9 @@
         if (input.id === 'sb-peer') sandbox.peerScale = parseFloat(input.value);
         if (input.id === 'sb-growth') sandbox.growthWeight = parseFloat(input.value);
         if (input.id === 'sb-maturity') sandbox.maturityRange = parseFloat(input.value);
+        if (input.id === 'sb-size') sandbox.sizeExponent = parseFloat(input.value);
         var out = document.getElementById(input.id + '-out');
-        if (out) out.textContent = input.id === 'sb-peer' ? sandbox.peerScale.toFixed(2) + '×' : (input.id === 'sb-growth' ? sandbox.growthWeight : sandbox.maturityRange).toFixed(2);
+        if (out) out.textContent = input.id === 'sb-peer' ? sandbox.peerScale.toFixed(2) + '×' : (input.id === 'sb-growth' ? sandbox.growthWeight : input.id === 'sb-maturity' ? sandbox.maturityRange : sandbox.sizeExponent).toFixed(2);
         rerenderTable();
         var banner = mount.querySelector('.banner');
         if (sandboxActive() && !banner) render();

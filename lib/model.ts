@@ -1,4 +1,4 @@
-// The token radar's model, version 2: one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model, version 3: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and every
 // other pre-token protocol the house's own rule would rank: pre-token, not an exchange, not a
@@ -11,19 +11,33 @@
 //
 //   peer     = the median market-cap / TVL of the live-token protocols in the same category,
 //              when that category has at least 5 live peers; otherwise the market-wide median
-//              of the same ratio (0.1691 on this snapshot). The multiple is clamped to
-//              [0.05, 1.0]: no launch is priced above its own TVL on a market-cap basis, and no
-//              category is priced on one thin outlier.
-//   base     = tvl_usd x peer
+//              of the same ratio (0.1691 on this snapshot).
+//   size     = (tvl_usd / size_reference_tvl) ^ size_exponent, where size_reference_tvl is the
+//              median TVL of the snapshot's live-token protocols in the peer table ($28,264,700
+//              here, 143 peers) and size_exponent is -0.54, fitted on the 128 of those peers
+//              with a positive ratio: across them, log(market-cap / TVL) falls 0.54 log points
+//              per log point of TVL (t = -5.2), and the slope is -0.49 to -0.57 in every
+//              subsample tried (dropping the giants, dropping the fast growers, capping growth
+//              at +-20). A protocol ten times larger therefore trades at about 0.29x the
+//              multiple, so the board's giants are priced at the multiple the market actually
+//              pays for their size, not at the small-protocol median.
+//   multiple = clamp(peer x size, peer_floor, peer_cap)
+//   base     = tvl_usd x multiple
 //   growth   = clamp(change_7d, -50, 100) per cent
 //   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
-//   maturity = 0.7 + min(age_days, 730) / 730 x 0.3   (age_days unknown: 365)
+//   maturity = 0.90 + min(age_days, 730) / 730 x 0.10   (age_days unknown: 365)
 //   implied  = max(1, round(base x growthMult x maturity))
 //
-// A launch is worth what the market already pays for the same kind of protocol, scaled by whether
-// the protocol is growing and how long it has held its TVL with no token. No protocol name is ever
-// special-cased: the same function scores every row, and the peer table is recomputed from whatever
-// snapshot the program is given.
+// Growth and maturity are small on purpose. The same fit that gives the size slope finds no
+// reliable premium for either: the 7-day growth slope is -0.05 per point with a standard error
+// of 0.02 on all 128 peers, but -0.03 (t = -1.1) once the fast growers are dropped and -0.02
+// (t = -0.6) within +-20 points, so a growing TVL does not raise the multiple — the week's
+// deposits are already inside TVL, and rewarding them again would double-count them. Age is
+// -0.52 log points over 730 days with a standard error of 0.75 (t = -0.7): no age premium at
+// all. Both stay in the formula, as small tilts, because the board's question names them; the
+// size term does the work the snapshot actually supports. No protocol name is ever
+// special-cased: the same function scores every row, and the peer table, the size reference
+// and the fitted exponent are recomputed or stated from whatever snapshot the program is given.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -53,6 +67,7 @@ export interface ModelConstants {
   peer_min_count: number;
   peer_floor: number;
   peer_cap: number;
+  size_exponent: number;
   growth_weight: number;
   growth_floor: number;
   growth_cap: number;
@@ -64,19 +79,20 @@ export interface ModelConstants {
 
 export const MODEL: ModelConstants = {
   peer_min_count: 5,
-  peer_floor: 0.05,
+  peer_floor: 0.01,
   peer_cap: 1.0,
-  growth_weight: 0.5,
+  size_exponent: -0.54,
+  growth_weight: 0.1,
   growth_floor: -50,
   growth_cap: 100,
-  maturity_floor: 0.7,
-  maturity_range: 0.3,
+  maturity_floor: 0.9,
+  maturity_range: 0.1,
   maturity_days: 730,
   unknown_age_days: 365,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-2';
+export const MODEL_VERSION = 'radar-3';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -113,6 +129,8 @@ export interface BoardRow {
   implied_value_usd: number;
   model: {
     peer_multiple: number;
+    peer_median: number;
+    size_multiplier: number;
     peer_count: number;
     peer_from_category: boolean;
     growth_pct: number;
@@ -137,6 +155,8 @@ export interface RadarRow {
   age_days: number | null;
   implied_value_usd: number;
   peer_multiple: number;
+  peer_median: number;
+  size_multiplier: number;
   peer_count: number;
   peer_from_category: boolean;
   growth_multiplier: number;
@@ -167,6 +187,7 @@ export interface RadarData {
   early_size: number;
   live_size: number;
   overall_peer_multiple: number;
+  size_reference_tvl: number;
   peers: Record<string, PeerEntry>;
   rows: RadarRow[];
   live: LiveRow[];
@@ -205,16 +226,22 @@ function median(sorted: number[]): number {
  * The peer table of a snapshot: for every category with live-token protocols, the median
  * market-cap / TVL of its live peers. A category with fewer than `model.peer_min_count` live
  * peers is priced on the market-wide median instead, so one thin outlier never prices a whole
- * category. The multiple is clamped to [peer_floor, peer_cap].
+ * category. The table also carries the size reference: the median TVL of the live peers, the
+ * size at which the category median is the multiple as stated.
  */
-export function peerTable(snapshot: Snapshot, model: ModelConstants = MODEL): { table: Record<string, PeerEntry>; overall: number } {
+export function peerTable(
+  snapshot: Snapshot,
+  model: ModelConstants = MODEL,
+): { table: Record<string, PeerEntry>; overall: number; sizeReferenceTvl: number } {
   const byCategory = new Map<string, number[]>();
   const all: number[] = [];
+  const liveTvls: number[] = [];
   for (const p of snapshot.protocols) {
     if (isPreToken(p) || p.mcap_usd === null || p.tvl_usd <= 0) continue;
     const ratio = p.mcap_usd / p.tvl_usd;
     if (!Number.isFinite(ratio) || ratio < 0) continue;
     all.push(ratio);
+    liveTvls.push(p.tvl_usd);
     const key = p.category ?? 'Other';
     const list = byCategory.get(key);
     if (list === undefined) byCategory.set(key, [ratio]);
@@ -222,6 +249,8 @@ export function peerTable(snapshot: Snapshot, model: ModelConstants = MODEL): { 
   }
   all.sort((a, b) => a - b);
   const overall = all.length > 0 ? median(all) : 0.1691;
+  liveTvls.sort((a, b) => a - b);
+  const sizeReferenceTvl = liveTvls.length > 0 ? median(liveTvls) : median(snapshot.protocols.map((p) => p.tvl_usd).sort((a, b) => a - b));
   const clamp = (n: number): number => Math.min(model.peer_cap, Math.max(model.peer_floor, n));
   const table: Record<string, PeerEntry> = {};
   for (const [key, ratios] of [...byCategory.entries()].sort((a, b) => (a[0] < b[0] ? -1 : 1))) {
@@ -232,7 +261,7 @@ export function peerTable(snapshot: Snapshot, model: ModelConstants = MODEL): { 
       table[key] = { n: ratios.length, multiple: clamp(overall), from_category: false };
     }
   }
-  return { table, overall };
+  return { table, overall, sizeReferenceTvl };
 }
 
 /** The peer multiple one category is priced at, from the table the snapshot produced. */
@@ -247,17 +276,36 @@ export function impliedValue(
   protocol: SnapshotProtocol,
   asOf: string,
   peer: PeerEntry,
+  sizeReferenceTvl: number,
   model: ModelConstants,
-): { implied: number; growthPct: number; growthMult: number; maturityMult: number; age: number | null } {
+): {
+  implied: number;
+  peerMultiple: number;
+  peerMedian: number;
+  sizeMultiplier: number;
+  growthPct: number;
+  growthMult: number;
+  maturityMult: number;
+  age: number | null;
+} {
   const age = ageDays(asOf, protocol.listed_at);
   const rawGrowth = finite(protocol.change_7d, 0);
   const growthPct = Math.min(model.growth_cap, Math.max(model.growth_floor, rawGrowth));
   const growthMult = 1 + (growthPct / 100) * model.growth_weight;
   const ageForModel = age ?? model.unknown_age_days;
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
-  const base = protocol.tvl_usd * peer.multiple;
+  // The size term: the peer median is the multiple at the reference size, and the multiple
+  // falls as TVL rises, at the fitted exponent. A protocol at the reference size is priced on
+  // the median as stated; a protocol ten times larger is priced at about 0.29x it.
+  const peerMedian = peer.multiple;
+  const sizeMultiplier = sizeReferenceTvl > 0 ? Math.pow(protocol.tvl_usd / sizeReferenceTvl, model.size_exponent) : 1;
+  const peerMultipleRaw = Math.min(model.peer_cap, Math.max(model.peer_floor, peerMedian * sizeMultiplier));
+  // The multiple the model prices with is the rounded one the board and the dashboard both carry,
+  // so the page's recomputation of implied value lands on the same dollar board.json carries.
+  const peerMultiple = Math.round(peerMultipleRaw * 1e4) / 1e4;
+  const base = protocol.tvl_usd * peerMultiple;
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
-  return { implied, growthPct, growthMult, maturityMult, age };
+  return { implied, peerMultiple, peerMedian, sizeMultiplier, growthPct, growthMult, maturityMult, age };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -307,7 +355,7 @@ export interface BoardSummary {
 
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
-  const { table, overall } = peerTable(snapshot, model);
+  const { table, overall, sizeReferenceTvl } = peerTable(snapshot, model);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
@@ -326,9 +374,24 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     const peer = peerMultiple(p.category, table, overall, model);
     // The multiple the model prices with is the rounded one the board and the dashboard both carry,
     // so the page's recomputation of implied value lands on the same dollar board.json carries.
-    const peerForModel = { ...peer, multiple: round4(peer.multiple) };
-    const { implied, growthPct, growthMult, maturityMult, age } = impliedValue(p, snapshot.as_of, peerForModel, model);
-    return { p, peer: peerForModel, implied, growthPct, growthMult, maturityMult, age };
+    const { implied, peerMultiple: multiple, peerMedian, sizeMultiplier, growthPct, growthMult, maturityMult, age } = impliedValue(
+      p,
+      snapshot.as_of,
+      peer,
+      sizeReferenceTvl,
+      model,
+    );
+    return {
+      p,
+      peer: { ...peer, multiple: round4(multiple) },
+      peerMedian: round4(peerMedian),
+      sizeMultiplier: round4(sizeMultiplier),
+      implied,
+      growthPct,
+      growthMult,
+      maturityMult,
+      age,
+    };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
   return scored.map((s, i) => ({
@@ -348,6 +411,8 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     implied_value_usd: s.implied,
     model: {
       peer_multiple: round4(s.peer.multiple),
+      peer_median: s.peerMedian,
+      size_multiplier: s.sizeMultiplier,
       peer_count: s.peer.n,
       peer_from_category: s.peer.from_category,
       growth_pct: s.growthPct,
@@ -418,6 +483,56 @@ function actionFor(p: SnapshotProtocol, capital: number, chain: string): string 
   return `Deposit $${capital} of USDC into ${name} on ${chain} and keep the position open.`;
 }
 
+/** The weekly action, in the words of what this category actually does once a week. */
+function weeklyActionFor(p: SnapshotProtocol, chain: string, gas: string): string {
+  const c = (p.category ?? '').toLowerCase();
+  const name = p.name;
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return `Supply or borrow once a week, and repay or top up the position on ${name} so it stays active.`;
+  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return `Swap or add liquidity once a week on ${name} so the position records activity.`;
+  if (c.includes('bridge')) return `Bridge a small amount once a week through ${name} and use the bridged funds in its app.`;
+  if (c.includes('staking') || c.includes('restak')) return `Restake or claim rewards once a week through ${name} and keep the receipt.`;
+  if (c.includes('perpetual') || c.includes('derivative')) return `Open or close one small hedged position once a week on ${name}.`;
+  if (c.includes('prediction')) return `Place one small market position a week on ${name}.`;
+  if (c.includes('curator') || c.includes('allocator') || c.includes('risk')) return `Deposit into a new ${name} vault, or rebalance between vaults, once a week.`;
+  if (c.includes('stable')) return `Mint or redeem the stable asset once a week through ${name} on ${chain}.`;
+  if (c.includes('rwa')) return `Check ${name}'s new listings once a week and hold the yield asset.`;
+  if (c.includes('insurance')) return `Renew or adjust the cover once a week through ${name}.`;
+  if (c.includes('basis')) return `Check the basis position on ${name} once a week and top it up when the spread widens.`;
+  return `Make one qualifying action each week on ${name}, such as a deposit, a borrow, a swap or a vote.`;
+}
+
+/** What a launch is usually preceded by, in this category's own terms. */
+function milestoneFor(p: SnapshotProtocol): string {
+  const c = (p.category ?? '').toLowerCase();
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return 'a launch is usually preceded by a new market listing or an interest-rate vote';
+  if (c.includes('dex')) return 'a launch is usually preceded by a new pool or a fee vote';
+  if (c.includes('curator') || c.includes('allocator') || c.includes('risk')) return 'a launch is usually preceded by a new vault or a new curator onboarding';
+  if (c.includes('rwa')) return 'a launch is usually preceded by a new asset listing';
+  if (c.includes('stable')) return 'a launch is usually preceded by a new collateral type or a peg-mechanism vote';
+  if (c.includes('perpetual') || c.includes('derivative')) return 'a launch is usually preceded by a new market listing';
+  if (c.includes('prediction')) return 'a launch is usually preceded by a new market category';
+  if (c.includes('bridge')) return 'a launch is usually preceded by a new route or a fee change';
+  if (c.includes('staking') || c.includes('restak')) return 'a launch is usually preceded by a new staking asset or a rewards change';
+  if (c.includes('basis')) return 'a launch is usually preceded by a new market listing or a new basis strategy';
+  if (c.includes('yield') || c.includes('leveraged farm') || c.includes('farm')) return 'a launch is usually preceded by a new vault or a new yield strategy';
+  return 'a launch is usually preceded by a points snapshot or a governance post';
+}
+
+/** The position the reader keeps a little of while unwinding, in this category's own terms. */
+function positionFor(p: SnapshotProtocol): string {
+  const c = (p.category ?? '').toLowerCase();
+  if (c.includes('lend') || c.includes('cdp') || c.includes('collateral')) return 'a small supply position';
+  if (c.includes('dex') || c.includes('yield') || c.includes('leveraged farm')) return 'a small liquidity position';
+  if (c.includes('staking') || c.includes('restak')) return 'a small staked position';
+  if (c.includes('perpetual') || c.includes('derivative')) return 'a small margin position';
+  if (c.includes('curator') || c.includes('allocator') || c.includes('risk')) return 'a small vault position';
+  if (c.includes('stable')) return 'a small stable-asset position';
+  if (c.includes('rwa')) return 'a small yield-asset position';
+  if (c.includes('insurance')) return 'a small cover position';
+  if (c.includes('basis')) return 'a small basis position';
+  return 'a small position';
+}
+
 /**
  * A protocol's farm plan: seven steps, each an action with a cost and a time. The plan is derived
  * from the protocol's own record (category, chains, TVL, age), never from a hand-written list of
@@ -430,9 +545,12 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
   const hold = holdDaysFor(age);
   const gas = gasFor(chain);
   const action = actionFor(p, capital, chain);
+  const weekly = weeklyActionFor(p, chain, gas);
+  const milestone = milestoneFor(p);
+  const position = positionFor(p);
   return [
     {
-      text: `Use a fresh wallet that holds only the funds you plan to farm, and keep its seed phrase offline.`,
+      text: `Use a fresh wallet on ${chain} that holds only the funds you plan to farm, and keep its seed phrase offline.`,
       cost: 'under $3 of gas for the first transaction',
       time: '5 minutes',
     },
@@ -442,7 +560,7 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '15 minutes to set up',
     },
     {
-      text: `Make one qualifying action each week, such as a deposit, a borrow, a swap or a vote.`,
+      text: weekly,
       cost: gas + ' a week',
       time: '10 minutes a week',
     },
@@ -457,12 +575,12 @@ export function farmSteps(p: SnapshotProtocol, age: number | null): FarmStep[] {
       time: '10 minutes',
     },
     {
-      text: `Check the protocol's announcements once a week: a launch is usually preceded by a points snapshot or a governance post, and the position must be open when it lands.`,
+      text: `Check the protocol's announcements once a week: ${milestone}, and the position must be open when it lands.`,
       cost: 'nothing but the check',
       time: '5 minutes a week',
     },
     {
-      text: `Write the wallet, the dates and every transaction in a farm log; when you unwind, withdraw in tranches and keep a small position until any claim window has closed.`,
+      text: `Write the wallet, the dates and every transaction in a farm log; when you unwind, withdraw in tranches and keep ${position} until any claim window has closed.`,
       cost: gas + ' to exit',
       time: '10 minutes to unwind',
     },
@@ -501,6 +619,8 @@ export function radarRow(row: BoardRow): RadarRow {
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
     peer_multiple: row.model.peer_multiple,
+    peer_median: row.model.peer_median,
+    size_multiplier: row.model.size_multiplier,
     peer_count: row.model.peer_count,
     peer_from_category: row.model.peer_from_category,
     growth_multiplier: row.model.growth_multiplier,
@@ -512,7 +632,7 @@ export function radarRow(row: BoardRow): RadarRow {
 export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): { board: BoardRow[]; radar: RadarData } {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
-  const { table, overall } = peerTable(snapshot, model);
+  const { table, overall, sizeReferenceTvl } = peerTable(snapshot, model);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -526,6 +646,7 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     early_size: early,
     live_size: live.length,
     overall_peer_multiple: round4(overall),
+    size_reference_tvl: sizeReferenceTvl,
     peers: table,
     rows: board.map(radarRow),
     live,

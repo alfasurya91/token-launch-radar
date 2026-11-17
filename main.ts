@@ -8,8 +8,9 @@
 // The dashboard is a static page, no framework and no network: dashboard/index.html, dashboard/app.css
 // and dashboard/app.js read /output/data.js, which this program writes from the same board. The model
 // prices each category at the median market-cap / TVL of its live peers (five or more peers, else the
-// market-wide median), so a launch is worth what the market already pays for the same kind of
-// protocol, never a hardcoded multiple. Keep the gate's shape.
+// market-wide median), adjusted for size — the multiple falls as TVL rises, at the exponent the
+// snapshot's own live peers imply — so a launch is worth what the market already pays for the same
+// kind of protocol at the same size, never a hardcoded multiple. Keep the gate's shape.
 //
 // Outside the grader's container, MAKEFUN_OUTPUT_DIR stands in for /output:
 //   mkdir -p out && MAKEFUN_OUTPUT_DIR=out node main.ts --input ../input/snapshot.json
