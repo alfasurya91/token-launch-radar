@@ -25,6 +25,39 @@
   }
   function clamp(n, lo, hi) { return Math.min(hi, Math.max(lo, n)); }
   function ageLabel(d) { return d == null ? '—' : d + ' d'; }
+  function fmtExact(n) { return '$' + Math.round(n).toString().replace(/\B(?=(\d{3})+(?!\d))/g, ','); }
+  function fmtMoney(n) { if (n === 0) return '$0'; if (n < 1) return '$' + n.toFixed(2); return '$' + Math.round(n); }
+  /* Category token-record rates, empirical from the snapshot (records a token = mcap, gecko_id or symbol non-null); only categories with n>=10 shown. */
+  var CATTOK = { 'Lending': [59, 75], 'Dexs': [73, 99], 'Basis Trading': [13, 21], 'Yield Aggregator': [14, 23], 'Yield': [23, 39], 'Canonical Bridge': [17, 32], 'RWA': [17, 33], 'Liquid Staking': [40, 78], 'Derivatives': [13, 26], 'CDP': [10, 20], 'Bridge': [27, 55], 'Staking Pool': [5, 11], 'Onchain Capital Allocator': [9, 29], 'CEX': [14, 56], 'Risk Curators': [5, 39] };
+  function oddsBand(o) { return o < 0.30 ? 'low' : o < 0.70 ? 'mid' : 'high'; }
+  function oddsChip(o) { if (o == null || !isFinite(o)) return '—'; return '<span class="chip ' + oddsBand(o) + '">' + (o * 100).toFixed(1) + '% · ' + oddsBand(o) + '</span>'; }
+  var LOGLO = Infinity, LOGHI = -Infinity;
+  DATA.rows.forEach(function (r) { if (r.range_low_usd) LOGLO = Math.min(LOGLO, Math.log(r.range_low_usd)); if (r.range_high_usd) LOGHI = Math.max(LOGHI, Math.log(r.range_high_usd)); });
+  function rangeBar(r) {
+    if (!r.range_low_usd || !r.range_high_usd || LOGHI <= LOGLO) return '';
+    var a = (Math.log(r.range_low_usd) - LOGLO) / (LOGHI - LOGLO) * 100;
+    var b = (Math.log(r.range_high_usd) - LOGLO) / (LOGHI - LOGLO) * 100;
+    return '<div class="rbar"><i style="left:' + a.toFixed(1) + '%;width:' + Math.max(1, b - a).toFixed(1) + '%"></i></div>';
+  }
+  function gasRange(chain) {
+    var c = (chain || '').toLowerCase();
+    if (c === 'ethereum') return [5, 20];
+    if (c === 'solana') return [0, 0.1];
+    if (c === 'tron') return [1, 3];
+    if (c === 'bitcoin' || c === 'bittensor') return [1, 5];
+    return [0, 1];
+  }
+  /** Farm verdict from the existing capitalFor / gasFor / holdDaysFor rules: ~6 txs at a 30-day hold, ~11 at 60 days; active minutes = 40 fixed + 15 per week. */
+  function farmVerdict(row) {
+    var hold = holdDaysFor(row.age_days);
+    var weeks = Math.round(hold / 7);
+    var txs = 2 + weeks, mins = 40 + 15 * weeks, hrs = mins / 60;
+    var g = gasRange(chainOf(row));
+    var lo = txs * g[0], hi = txs * g[1];
+    var peers = DATA.peers[row.category];
+    var verdict = (row.age_days == null || (peers && peers.n < 5)) ? 'Check first' : (hi > 100 ? 'Thin' : 'Farm');
+    return { capital: capitalFor(row), hold: hold, txs: txs, mins: mins, hrs: hrs, lo: lo, hi: hi, verdict: verdict, cphLo: lo / hrs, cphHi: hi / hrs };
+  }
 
   /** The model, recomputed in the page from the snapshot's own figures, so the board and the code agree. */
   function growthOf(row, growthWeight) {
@@ -167,7 +200,7 @@
   /** The state the URL carries, so a view can be linked and screenshotted. */
   function readHash() {
     var h = (location.hash || '').replace(/^#/, '');
-    var s = { q: '', category: '', chain: '', wl: false, tab: 'pre', p: '', sort: 'rank', dir: 1 };
+    var s = { q: '', category: '', chain: '', wl: false, odds50: false, hidemed: false, tab: 'pre', p: '', sort: 'rank', dir: 1 };
     h.split('&').forEach(function (pair) {
       var kv = pair.split('=');
       if (kv.length !== 2) return;
@@ -177,6 +210,8 @@
       if (k === 'category') s.category = v;
       if (k === 'chain') s.chain = v;
       if (k === 'wl') s.wl = v === '1';
+      if (k === 'odds50') s.odds50 = v === '1';
+      if (k === 'hidemed') s.hidemed = v === '1';
       if (k === 'tab') s.tab = v === 'live' ? 'live' : 'pre';
       if (k === 'p') s.p = v;
       if (k === 'sort') s.sort = v;
@@ -195,6 +230,8 @@
     if (state.category) parts.push('category=' + encodeURIComponent(state.category));
     if (state.chain) parts.push('chain=' + encodeURIComponent(state.chain));
     if (state.wl) parts.push('wl=1');
+    if (state.odds50) parts.push('odds50=1');
+    if (state.hidemed) parts.push('hidemed=1');
     if (state.tab !== 'pre') parts.push('tab=' + state.tab);
     if (state.p) parts.push('p=' + encodeURIComponent(state.p));
     if (state.sort !== 'rank') parts.push('sort=' + state.sort);
@@ -217,6 +254,8 @@
     var sb = sandboxActive() ? sandbox : null;
     var rows = DATA.rows.filter(function (r) {
       if (state.wl && !isWatchlist(r.slug)) return false;
+      if (state.odds50 && (r.token_record_odds || 0) < 0.50) return false;
+      if (state.hidemed && !r.peer_from_category) return false;
       if (state.category && r.category !== state.category) return false;
       if (state.chain && (r.chains || []).indexOf(state.chain) < 0) return false;
       if (q && (r.name + ' ' + r.slug + ' ' + (r.category || '')).toLowerCase().indexOf(q) < 0) return false;
@@ -232,6 +271,10 @@
       else if (key === 'growth') d = (a.row.change_7d || 0) - (b.row.change_7d || 0);
       else if (key === 'age') d = (a.row.age_days == null ? -1 : a.row.age_days) - (b.row.age_days == null ? -1 : b.row.age_days);
       else if (key === 'peer') d = a.row.peer_multiple - b.row.peer_multiple;
+      else if (key === 'odds') d = (a.row.token_record_odds || 0) - (b.row.token_record_odds || 0);
+      else if (key === 'rangeLow') d = (a.row.range_low_usd || 0) - (b.row.range_low_usd || 0);
+      else if (key === 'rangeHigh') d = (a.row.range_high_usd || 0) - (b.row.range_high_usd || 0);
+      else if (key === 'xodds') d = a.value * (a.row.token_record_odds || 0) - b.value * (b.row.token_record_odds || 0);
       else if (key === 'value') d = a.value - b.value;
       else d = a.row.rank - b.row.rank;
       return d * state.dir;
@@ -262,11 +305,12 @@
       '<div><span>Peer median × size</span><b>' + row.peer_median.toFixed(4) + ' × ' + row.size_multiplier.toFixed(3) + ' = ' + row.peer_multiple.toFixed(4) + '</b></div>' +
       '<div><span>Growth × maturity</span><b>' + growthOf(row, MODEL.growth_weight).toFixed(3) + ' × ' + maturityOf(row, MODEL.maturity_range).toFixed(3) + '</b></div>' +
       '<div><span>Age with no token</span><b>' + ageLabel(row.age_days) + '</b></div></div>' +
-      '<p class="sub">The peer multiple is ' + esc(peer) + ', priced at the reference size of ' + fmtUsd(DATA.size_reference_tvl) + ' of TVL and then adjusted for this protocol\'s size: ' + fmtUsd(row.tvl_usd) + ' of TVL trades at ×' + row.size_multiplier.toFixed(3) + ' of the reference multiple, because the snapshot\'s live peers show the multiple falls as TVL rises (fitted −0.54 per log point of TVL). Growth is ' + fmtPct(row.change_7d) + ' over 7 days, clamped to −50…+100% and weighted 0.10 — the week\'s deposits are already inside TVL. Maturity rises with age to 730 days, from 0.90 to 1.00; a protocol with no listing date is priced at 365 days. The multiple is clamped to 0.01–1.00.</p>' +
+      '<p class="sub">The peer multiple is ' + esc(peer) + ', priced at the reference size of ' + fmtUsd(DATA.size_reference_tvl) + ' of TVL and then adjusted for this protocol\'s size: ' + fmtUsd(row.tvl_usd) + ' of TVL trades at ×' + row.size_multiplier.toFixed(3) + ' of the reference multiple, because the snapshot\'s live peers show the multiple falls as TVL rises (fitted −0.48 per log point of TVL, n=128, se 0.095, t −5.04). Growth is ' + fmtPct(row.change_7d) + ' over 7 days, clamped to −50…+100% and weighted 0.00 — fitted, dropped on blind tests (§2). Maturity is 1.00 at every age — fitted, dropped on blind tests (§2). A protocol with no listing date is shown as age unknown, never silently imputed. The multiple is clamped to 0.01–1.00.</p>' +
       (recomputed === row.implied_value_usd
         ? '<p class="sub">The dashboard recomputed this value from the snapshot\'s own figures and landed on the same dollar board.json carries.</p>'
         : '<p class="sub">The dashboard recomputed ' + fmtUsd(recomputed) + ' from the snapshot\'s own figures; board.json carries ' + fmtUsd(row.implied_value_usd) + '. The two should agree.</p>') +
       '</div>' +
+      oddsBlock(row) + intervalBlock(row) + verdictBlock(row) +
       '<div class="detail-section"><h3>How to farm it</h3><ol class="steps">' +
       steps.map(function (s) { return '<li><b>' + esc(s.text) + '</b><span class="cost">Cost: ' + esc(s.cost) + '. Time: ' + esc(s.time) + '.</span></li>'; }).join('') +
       '</ol><p class="sub">The plan is derived from this protocol\'s category, chain, TVL and age. It never claims a points program exists: step five tells you to check the protocol\'s own page, and to claim only from the link that page publishes.</p></div>' +
@@ -279,6 +323,29 @@
     if (dialog && dialog.open) dialog.close();
     state.p = '';
     writeHash();
+  }
+
+  function oddsBlock(row) {
+    var o = row.token_record_odds;
+    var pct = (o == null || !isFinite(o)) ? '—' : (o * 100).toFixed(1) + '%';
+    var cat = CATTOK[row.category];
+    var catTxt = cat ? 'In this category, ' + (cat[0] / cat[1] * 100).toFixed(1) + '% of protocols record a token (' + cat[0] + '/' + cat[1] + ').' : 'This category has fewer than 10 protocols in the snapshot, so no category rate is shown.';
+    var ageTxt = row.age_days == null ? ' Age unknown.' : '';
+    return '<div class="detail-section"><h3>Token record (peers): ' + oddsChip(o) + '</h3>' +
+      '<p class="sub">Among protocols in this snapshot at this size, age and category, ' + pct + ' record a token. That is the peers\' record, not a prediction that this protocol will issue one, or when. ' + catTxt + ageTxt + '</p>' +
+      '<p class="sub">Peer-token rate overall: 54.9% (416/758). Odds model 5-fold CV AUC 0.784; age is the signal (OR 1.85/yr) and TVL alone does not separate token-record (AUC 0.524).</p></div>';
+  }
+  function intervalBlock(row) {
+    function rng(q) { return fmtUsd(row.implied_value_usd * Math.exp(-q)) + ' – ' + fmtUsd(row.implied_value_usd * Math.exp(q)); }
+    return '<div class="detail-section"><h3>80% peer range: ' + fmtUsd(row.range_low_usd) + ' – ' + fmtUsd(row.range_high_usd) + '</h3>' + rangeBar(row) +
+      '<p class="sub">50%: ' + rng(DATA.conformal_q50) + ' · 80%: ' + rng(DATA.conformal_q80) + ' · 90%: ' + rng(DATA.conformal_q90) + '.</p>' +
+      '<p class="sub">LOO residuals n=128, SD 2.11 log points; the peers\' record spans ~131× at 80%. One global interval: per-category intervals were tested and rejected (only 7 categories have ≥8 live peers; spreads unstable).</p></div>';
+  }
+  function verdictBlock(row) {
+    var v = farmVerdict(row);
+    return '<div class="detail-section"><h3>Farm verdict: ' + v.verdict + '</h3>' +
+      '<p class="sub">Capital $' + v.capital + ' · ' + v.txs + ' transactions over ' + v.hold + ' days · gas ' + fmtMoney(v.lo) + '–' + fmtMoney(v.hi) + ' total · ' + v.mins + ' active minutes (' + v.hrs.toFixed(1) + ' h) · ' + fmtMoney(v.cphLo) + '–' + fmtMoney(v.cphHi) + ' of gas per active hour of exposure.</p>' +
+      '<p class="sub">Cost per active hour is gas divided by active hours — not dollars per hour of profit; no per-farmer payout exists or is claimed. Rule: "Thin" when the plan\'s gas high end exceeds $100; otherwise "Farm". "Check first" when age is unknown or the category has fewer than 5 live peers. Never auto-"Skip".</p></div>';
   }
 
   /** One table head cell that sorts on click. */
@@ -314,16 +381,35 @@
         '<td class="num">' + fmtUsd(r.tvl_usd) + '</td>' +
         '<td class="num ' + (g == null ? '' : g >= 0 ? 'pos' : 'neg') + '">' + fmtPct(g) + '</td>' +
         '<td class="num">' + ageLabel(r.age_days) + '</td>' +
-        '<td class="num">' + r.peer_multiple.toFixed(2) + '<br><span class="sub">' + (r.peer_from_category ? r.peer_count + ' peers' : 'market') + ' · ×' + r.size_multiplier.toFixed(2) + '</span></td>' +
+        '<td class="num">' + r.peer_multiple.toFixed(2) + ' <span class="sub">· ' + (r.peer_from_category ? r.peer_count + ' peers' : 'market') + ' · ×' + r.size_multiplier.toFixed(2) + '</span></td>' +
         '<td class="implied"><div class="bar"><i style="width:' + Math.max(2, Math.round(it.value / max * 100)) + '%"></i></div><b>' + fmtUsd(it.value) + '</b>' + (sb ? ' <span class="sub">sandbox</span>' : '') + '</td>' +
+        '<td class="num">' + oddsChip(r.token_record_odds) + ' <span class="sub">n=758</span></td>' +
+        '<td class="num">' + fmtUsd(r.range_low_usd) + '–' + fmtUsd(r.range_high_usd) + rangeBar(r) + '</td>' +
+        '<td class="num">' + fmtUsd(it.value * (r.token_record_odds || 0)) + '</td>' +
         '<td><span class="status hot">pre-token</span></td></tr>';
     }).join('');
     if (!rowsHtml) {
       return '<div class="panel empty"><h2>No protocol matches</h2><p>Try a shorter search, another category, or clear the watchlist filter.</p><button class="button" type="button" data-clear>Clear the filters</button></div>';
     }
-    return '<div class="panel"><div class="table-wrap"><table><caption>' + items.length + ' pre-token protocol' + (items.length === 1 ? '' : 's') + ', ranked by implied launch value' + (sb ? ' under the sandbox model' : '') + '. Click a row for the model and the farm plan.</caption><thead><tr>' +
-      th('Rank', 'rank', 'num') + th('Protocol', 'name') + th('TVL', 'tvl', 'num') + th('7d', 'growth', 'num') + th('Age', 'age', 'num') + th('Peer', 'peer', 'num') + th('Implied value', 'value', 'num') + '<th>Token</th></tr></thead><tbody>' +
+    return '<div class="panel"><div class="table-wrap"><table><caption>' + items.length + ' pre-token protocol' + (items.length === 1 ? '' : 's') + ', ranked by implied launch value' + (sb ? ' under the sandbox model' : '') + '. Click a row for the model and the farm plan. Implied × odds is a reader sort — not the board rank.</caption><thead><tr>' +
+      th('Rank', 'rank', 'num') + th('Protocol', 'name') + th('TVL', 'tvl', 'num') + th('7d', 'growth', 'num') + th('Age', 'age', 'num') + th('Peer', 'peer', 'num') + th('Implied value', 'value', 'num') + th('Token record (peers)', 'odds', 'num') + th('80% range', 'rangeLow', 'num') + th('Implied × odds', 'xodds', 'num') + '<th>Token</th></tr></thead><tbody>' +
       rowsHtml + '</tbody></table></div></div>';
+  }
+
+  function renderDisposition() {
+    var d = DATA.disposition;
+    if (!d) return '';
+    var dis = DATA.dispositions || [];
+    var order = ['excluded-category', 'versioned-name', 'wrapped/staked-word'];
+    var items = order.map(function (reason) {
+      var n = (d.excluded_by_reason && d.excluded_by_reason[reason]) || 0;
+      var first = dis.filter(function (x) { return x.exclude_reason === reason; }).slice(0, 3).map(function (x) { return x.slug; }).join(', ');
+      return '<li><b>' + esc(reason) + ': ' + n + '</b> — first: ' + esc(first) + '</li>';
+    }).join('');
+    return '<section class="panel model" aria-label="758-protocol audit"><h2>758-protocol audit: where every protocol went</h2>' +
+      '<p>Ranked ' + d.ranked + ' · live with market cap ' + d.live_with_mcap + ' (' + DATA.live_size + ' shown) · token recorded but no market cap ' + d.token_but_no_mcap + ' · excluded ' + d.excluded + '.</p>' +
+      '<ul class="disp">' + items + '</ul>' +
+      '<p class="sub">Excluded protocols are not board rows: excluded-category, versioned-name and wrapped/staked-word protocols are not launches under the house rule. Live-token protocols are shown separately with market values, never mixed into the ranking.</p></section>';
   }
 
   function renderModel() {
@@ -332,18 +418,25 @@
       return '<tr><td>' + esc(p.category) + '</td><td class="num">' + p.entry.n + '</td><td class="num">' + p.entry.multiple.toFixed(4) + '</td><td>' + (p.entry.from_category ? 'category peers' : 'market-wide median') + '</td></tr>';
     }).join('');
     return '<section class="panel model" aria-label="The model"><h2>The model: worth what its peers trade for</h2>' +
-      '<p>Each category is priced at the median market-cap / TVL of its live-token peers, when the category has at least five live peers; otherwise the market-wide median. That median is the multiple at the reference size of ' + fmtUsd(DATA.size_reference_tvl) + ' of TVL, and it is then adjusted for the protocol\'s own size: the multiple falls as TVL rises, so a protocol ten times larger trades at about 0.29× the multiple. The multiple is clamped to 0.01–1.00, so no launch is priced above its own TVL on a market-cap basis and no category is priced on one thin outlier.</p>' +
-      '<p>Why the size term: across the snapshot\'s 128 live-token peers, log(market-cap / TVL) falls 0.54 per log point of TVL (t = −5.2), and the same slope holds within categories and after dropping the largest protocols. Growth and age show no reliable premium in the same fit — a growing TVL does not raise the multiple, because the week\'s deposits are already inside TVL, and age shows no effect at all — so they move the value only a little: growth is weighted 0.10, maturity rises from 0.90 to 1.00 over 730 days.</p>' +
-      '<p class="formula">implied = TVL × peer × size&nbsp;&nbsp;×&nbsp;&nbsp;(1 + clamp(7d, −50, 100) / 100 × ' + MODEL.growth_weight + ')&nbsp;&nbsp;×&nbsp;&nbsp;(0.90 + min(age, 730) / 730 × ' + MODEL.maturity_range + ')</p>' +
-      '<p class="sub">peer × size = the category median × (TVL / ' + fmtUsd(DATA.size_reference_tvl) + ')^(' + MODEL.size_exponent + ').</p>' +
+      '<p>Each category is priced at the median market-cap / TVL of its live-token peers, when the category has at least five live peers; otherwise the market-wide median. That median is the multiple at the reference size of ' + fmtUsd(DATA.size_reference_tvl) + ' of TVL, and it is then adjusted for the protocol\'s own size: the multiple falls as TVL rises, so a protocol ten times larger trades at about 0.33× the multiple. The multiple is clamped to 0.01–1.00, so no launch is priced above its own TVL on a market-cap basis and no category is priced on one thin outlier.</p>' +
+      '<p>Why the size term: across the snapshot\'s 128 live-token peers, log(market-cap / TVL) falls 0.48 per log point of TVL (n=128, se 0.095, t −5.04), and LOO refits range −0.50…−0.45. Growth and age were fitted and then dropped on blind tests (table below): growth is weighted 0.00, maturity is 1.00 at every age — a growing TVL does not raise the multiple, because the week\'s deposits are already inside TVL, and age shows no reliable effect. Growth and age stay visible as per-row facts, with the note "fitted, dropped on blind tests (§2)".</p>' +
+      '<p class="formula">implied = TVL × peer × size&nbsp;&nbsp;×&nbsp;&nbsp;(1 + clamp(7d, −50, 100) / 100 × 0.00)&nbsp;&nbsp;×&nbsp;&nbsp;1.00</p>' +
+      '<p class="sub">peer × size = the category median × (TVL / ' + fmtUsd(DATA.size_reference_tvl) + ')^(' + MODEL.size_exponent + '). Growth weight 0.00 and maturity 1.00: both fitted, both dropped on blind tests.</p>' +
+      '<h3>Held-out tests: what was kept, what was dropped</h3>' +
+      '<table class="peer-table"><thead><tr><th>Model</th><th class="num">In-sample</th><th class="num">LOO RMSE</th><th class="num">5-fold RMSE</th><th class="num">Walk-forward R²</th><th>Verdict</th></tr></thead><tbody>' +
+      '<tr><td>M0 intercept-only</td><td class="num">—</td><td class="num">2.295</td><td class="num">2.255</td><td class="num">−0.00 / −0.02</td><td>Baseline</td></tr>' +
+      '<tr><td>M1 log TVL (size)</td><td class="num">R² 0.168</td><td class="num">2.107</td><td class="num">2.062</td><td class="num">+0.072 / +0.140</td><td>KEEP −0.48</td></tr>' +
+      '<tr><td>M2 + growth</td><td class="num">—</td><td class="num">2.115</td><td class="num">2.081</td><td class="num">+0.069 / +0.156</td><td>DROP weight 0</td></tr>' +
+      '<tr><td>M3 + age (n=95)</td><td class="num">—</td><td class="num">1.997*</td><td class="num">2.004*</td><td class="num">−0.50 / singular</td><td>DROP ×1.00</td></tr>' +
+      '<tr><td>M4 + growth + age (n=95)</td><td class="num">—</td><td class="num">2.022*</td><td class="num">2.051*</td><td class="num">−0.05 / −6.26</td><td>DROP</td></tr></tbody></table>' +
+      '<p class="sub">* M3/M4 LOO and 5-fold are on the age-known subset n=95; M1 on the same 95 scores 1.986 (LOO) and 1.982 (5-fold) — age loses on the same subset. LOO RMSE 2.107 vs naive 2.295 is ×1.09. Walk-forward fits the oldest-listed protocols and tests the newest (70/30, then 50/50). Conformal q50 1.2243, q80 2.4383, q90 3.7293 (LOO n=128, SD 2.11). Odds CV AUC 0.784, base rate 0.549.</p>' +
+      '<p class="sub">The previous version quoted −0.54; that slope is the age-known subset (n=95). The all-peer fit is −0.48.</p>' +
       '<table class="peer-table"><thead><tr><th>Category</th><th class="num">Live peers</th><th class="num">Multiple</th><th>Priced on</th></tr></thead><tbody>' + rows + '</tbody></table>' +
       '<p class="sub">The multiples above are the multiple at the reference size of ' + fmtUsd(DATA.size_reference_tvl) + ' of TVL; the board applies the size adjustment per protocol. Market-wide median mcap / TVL: ' + DATA.overall_peer_multiple.toFixed(4) + '. ' + DATA.board_size + ' protocols ranked; ' + DATA.watchlist_size + ' on the watchlist, all covered; ' + DATA.early_size + ' more below the $' + (DATA.floor_usd / 1e6) + 'M floor. Live-token protocols are set aside and shown as the market\'s own values, never mixed into the ranking.</p>' +
-      '<div class="sandbox"><h3>Model sandbox</h3><p>Change the constants and watch the board re-rank. This only changes the view in this page; the submitted board is the one main.ts wrote with the constants above.</p>' +
+      '<div class="sandbox"><h3>Model sandbox</h3><p>Change the constants and watch the board re-rank. This only changes the view in this page; the submitted board is the one main.ts wrote with the constants above. Growth and age have no sliders: they are fixed at weight 0 and multiplier 1.00, fitted and dropped on blind tests. The size slider moves ±0.10 around −0.48.</p>' +
       '<div class="sliders">' +
       '<div><label for="sb-peer">Peer multiple scale: <output id="sb-peer-out">' + sandbox.peerScale.toFixed(2) + '×</output></label><input id="sb-peer" type="range" min="0.5" max="2" step="0.05" value="' + sandbox.peerScale + '"></div>' +
-      '<div><label for="sb-growth">Growth weight: <output id="sb-growth-out">' + sandbox.growthWeight.toFixed(2) + '</output></label><input id="sb-growth" type="range" min="0" max="1" step="0.05" value="' + sandbox.growthWeight + '"></div>' +
-      '<div><label for="sb-maturity">Maturity range: <output id="sb-maturity-out">' + sandbox.maturityRange.toFixed(2) + '</output></label><input id="sb-maturity" type="range" min="0" max="0.6" step="0.05" value="' + sandbox.maturityRange + '"></div>' +
-      '<div><label for="sb-size">Size exponent: <output id="sb-size-out">' + sandbox.sizeExponent.toFixed(2) + '</output></label><input id="sb-size" type="range" min="-1" max="0" step="0.05" value="' + sandbox.sizeExponent + '"></div>' +
+      '<div><label for="sb-size">Size exponent: <output id="sb-size-out">' + sandbox.sizeExponent.toFixed(2) + '</output></label><input id="sb-size" type="range" min="-0.58" max="-0.38" step="0.01" value="' + sandbox.sizeExponent + '"></div>' +
       '</div></div></section>';
   }
 
@@ -351,9 +444,20 @@
     var sb = sandboxActive();
     var wlCount = 0;
     DATA.rows.forEach(function (r) { if (isWatchlist(r.slug)) wlCount++; });
+    var boardTotal = DATA.rows.reduce(function (s, r) { return s + r.implied_value_usd; }, 0);
+    var floorN = 0, capN = 0, medN = 0, basisTop = 0;
+    DATA.rows.forEach(function (r) {
+      if (r.peer_multiple <= 0.01) floorN++;
+      if (r.peer_multiple >= 1) capN++;
+      if (!r.peer_from_category) medN++;
+    });
+    DATA.rows.slice(0, 20).forEach(function (r) { if (r.category === 'Basis Trading') basisTop++; });
+    var catsUnder5 = Object.keys(DATA.peers).filter(function (k) { return DATA.peers[k].n < 5; }).length;
+    var catsTotal = Object.keys(DATA.peers).length;
     mount.innerHTML = '<div class="shell">' +
       '<header class="top"><div class="brand"><span class="mark" aria-hidden="true"></span>Token Radar</div>' +
       '<div class="top-meta"><span>Snapshot ' + esc(DATA.as_of) + '</span><span>Model ' + esc(DATA.model_version) + '</span><span>' + DATA.board_size + ' rows</span></div></header>' +
+      '<div class="kpi">' + (DATA.disposition ? DATA.disposition.total : 758) + ' protocols accounted for · ' + DATA.board_size + ' ranked · watchlist ' + wlCount + '/' + DATA.watchlist_size + ' · board total ' + fmtExact(boardTotal) + ' · size ' + MODEL.size_exponent.toFixed(2) + ' · LOO ×1.09 · odds AUC 0.78</div>' +
       '<section class="lede"><h1>The protocols with no token yet, ranked by what a launch would be worth</h1>' +
       '<p>One sealed DefiLlama snapshot, ' + DATA.board_size + ' pre-token protocols, each priced like its live-token peers, adjusted for size: the bigger the protocol, the lower the multiple the market pays. The watchlist is the floor, never the ceiling: every watchlist protocol is here, and so is every other pre-token protocol the rule would rank. Click a row for the model behind its number and a plan to farm it.</p>' +
       '<div class="facts">' +
@@ -369,10 +473,14 @@
       '<div class="field"><label for="chain">Chain</label><select id="chain"><option value="">All chains</option>' +
       chains.map(function (c) { return '<option value="' + esc(c) + '"' + (state.chain === c ? ' selected' : '') + '>' + esc(c) + '</option>'; }).join('') + '</select></div>' +
       '<label class="check"><input id="wl" type="checkbox"' + (state.wl ? ' checked' : '') + '> Watchlist only</label>' +
+      '<label class="check"><input id="odds50" type="checkbox"' + (state.odds50 ? ' checked' : '') + '> Peers-with-token ≥ 50%</label>' +
+      '<label class="check"><input id="hidemed" type="checkbox"' + (state.hidemed ? ' checked' : '') + '> Hide market-median rows</label>' +
       '<div class="tabs"><button type="button" data-tab="pre" aria-pressed="' + (state.tab === 'pre') + '">Pre-token</button><button type="button" data-tab="live" aria-pressed="' + (state.tab === 'live') + '">Live token</button></div>' +
       '<span class="count" id="count"></span></div>' +
       (sb ? '<div class="banner"><span>Sandbox view: the board is re-ranked under the model constants you changed. This is not the submitted board.</span><button type="button" data-reset-sandbox>Reset the model</button></div>' : '') +
       '<div id="table-slot"></div>' +
+      '<div class="integrity">Integrity: ' + floorN + ' rows at the 0.01 floor · ' + capN + ' row' + (capN === 1 ? '' : 's') + ' at the 1.00 cap · ' + medN + '/' + DATA.board_size + ' rows on the market-wide median (' + catsUnder5 + '/' + catsTotal + ' categories &lt; 5 live peers) · Basis Trading ' + basisTop + '/20 top rows.</div>' +
+      renderDisposition() +
       renderModel() +
       '<footer class="foot"><p>Source: ' + esc(DATA.source) + ', fetched ' + esc(DATA.as_of) + '. Floor: $' + (DATA.floor_usd / 1e6) + 'M TVL. The dashboard runs entirely from data.js next to it: no fetch, no network, no tracking.</p>' +
       '<p>An implied value is an estimate of what a token would be worth if the market priced the protocol like its live peers. It is not a price, not a launch date, and not an airdrop promise. Nothing here is financial advice.</p></footer>' +
@@ -386,6 +494,8 @@
     mount.querySelector('#category').addEventListener('change', function (e) { state.category = e.target.value; writeHash(); rerenderTable(); });
     mount.querySelector('#chain').addEventListener('change', function (e) { state.chain = e.target.value; writeHash(); rerenderTable(); });
     mount.querySelector('#wl').addEventListener('change', function (e) { state.wl = e.target.checked; writeHash(); rerenderTable(); });
+    mount.querySelector('#odds50').addEventListener('change', function (e) { state.odds50 = e.target.checked; writeHash(); rerenderTable(); });
+    mount.querySelector('#hidemed').addEventListener('change', function (e) { state.hidemed = e.target.checked; writeHash(); rerenderTable(); });
     mount.querySelectorAll('[data-tab]').forEach(function (b) {
       b.addEventListener('click', function () { state.tab = b.getAttribute('data-tab'); writeHash(); render(); });
     });
@@ -402,7 +512,7 @@
       tr.addEventListener('click', function () { openDetail(tr.getAttribute('data-slug')); });
     });
     var clear = mount.querySelector('[data-clear]');
-    if (clear) clear.addEventListener('click', function () { state.q = ''; state.category = ''; state.chain = ''; state.wl = false; writeHash(); render(); });
+    if (clear) clear.addEventListener('click', function () { state.q = ''; state.category = ''; state.chain = ''; state.wl = false; state.odds50 = false; state.hidemed = false; writeHash(); render(); });
     var reset = mount.querySelector('[data-reset-sandbox]');
     if (reset) reset.addEventListener('click', function () {
       sandbox = { peerScale: 1, growthWeight: MODEL.growth_weight, maturityRange: MODEL.maturity_range, sizeExponent: MODEL.size_exponent };
@@ -411,11 +521,9 @@
     mount.querySelectorAll('.sliders input[type="range"]').forEach(function (input) {
       input.addEventListener('input', function () {
         if (input.id === 'sb-peer') sandbox.peerScale = parseFloat(input.value);
-        if (input.id === 'sb-growth') sandbox.growthWeight = parseFloat(input.value);
-        if (input.id === 'sb-maturity') sandbox.maturityRange = parseFloat(input.value);
         if (input.id === 'sb-size') sandbox.sizeExponent = parseFloat(input.value);
         var out = document.getElementById(input.id + '-out');
-        if (out) out.textContent = input.id === 'sb-peer' ? sandbox.peerScale.toFixed(2) + '×' : (input.id === 'sb-growth' ? sandbox.growthWeight : input.id === 'sb-maturity' ? sandbox.maturityRange : sandbox.sizeExponent).toFixed(2);
+        if (out) out.textContent = input.id === 'sb-peer' ? sandbox.peerScale.toFixed(2) + '×' : sandbox.sizeExponent.toFixed(2);
         rerenderTable();
         var banner = mount.querySelector('.banner');
         if (sandboxActive() && !banner) render();
@@ -443,7 +551,7 @@
       tr.addEventListener('click', function () { openDetail(tr.getAttribute('data-slug')); });
     });
     var clear = mount.querySelector('[data-clear]');
-    if (clear) clear.addEventListener('click', function () { state.q = ''; state.category = ''; state.chain = ''; state.wl = false; writeHash(); render(); });
+    if (clear) clear.addEventListener('click', function () { state.q = ''; state.category = ''; state.chain = ''; state.wl = false; state.odds50 = false; state.hidemed = false; writeHash(); render(); });
   }
 
   dialog = document.createElement('dialog');

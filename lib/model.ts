@@ -1,4 +1,4 @@
-// The token radar's model, version 3: one snapshot of the protocol universe in, one ranked board out.
+// The token radar's model, version 4: one snapshot of the protocol universe in, one ranked board out.
 //
 // The board covers every slug in the snapshot's watchlist (the floor, never a ceiling) and every
 // other pre-token protocol the house's own rule would rank: pre-token, not an exchange, not a
@@ -14,30 +14,34 @@
 //              of the same ratio (0.1691 on this snapshot).
 //   size     = (tvl_usd / size_reference_tvl) ^ size_exponent, where size_reference_tvl is the
 //              median TVL of the snapshot's live-token protocols in the peer table ($28,264,700
-//              here, 143 peers) and size_exponent is -0.54, fitted on the 128 of those peers
-//              with a positive ratio: across them, log(market-cap / TVL) falls 0.54 log points
-//              per log point of TVL (t = -5.2), and the slope is -0.49 to -0.57 in every
-//              subsample tried (dropping the giants, dropping the fast growers, capping growth
-//              at +-20). A protocol ten times larger therefore trades at about 0.29x the
-//              multiple, so the board's giants are priced at the multiple the market actually
-//              pays for their size, not at the small-protocol median.
+//              here, 143 peers) and size_exponent is -0.48, fitted on all 128 of those peers
+//              with a positive ratio: across them, log(market-cap / TVL) falls 0.48 log points
+//              per log point of TVL (se 0.095, t = -5.04). The exponent is stable under
+//              leave-one-out refits (range -0.50 to -0.45). A protocol ten times larger
+//              therefore trades at about 0.33x the multiple, so the board's giants are priced at
+//              the multiple the market actually pays for their size, not at the small-protocol
+//              median.
 //   multiple = clamp(peer x size, peer_floor, peer_cap)
 //   base     = tvl_usd x multiple
-//   growth   = clamp(change_7d, -50, 100) per cent
-//   growthMult = 1 + (growth / 100) x GROWTH_WEIGHT
-//   maturity = 0.90 + min(age_days, 730) / 730 x 0.10   (age_days unknown: 365)
-//   implied  = max(1, round(base x growthMult x maturity))
+//   implied  = max(1, round(base))
 //
-// Growth and maturity are small on purpose. The same fit that gives the size slope finds no
-// reliable premium for either: the 7-day growth slope is -0.05 per point with a standard error
-// of 0.02 on all 128 peers, but -0.03 (t = -1.1) once the fast growers are dropped and -0.02
-// (t = -0.6) within +-20 points, so a growing TVL does not raise the multiple — the week's
-// deposits are already inside TVL, and rewarding them again would double-count them. Age is
-// -0.52 log points over 730 days with a standard error of 0.75 (t = -0.7): no age premium at
-// all. Both stay in the formula, as small tilts, because the board's question names them; the
-// size term does the work the snapshot actually supports. No protocol name is ever
-// special-cased: the same function scores every row, and the peer table, the size reference
-// and the fitted exponent are recomputed or stated from whatever snapshot the program is given.
+// Growth and age were fitted and then dropped, on blind tests, not on a hunch. The size-only
+// model beats intercept-only out of sample: leave-one-out RMSE 2.107 log points against 2.295
+// for the intercept-only model (a 1.09x improvement), and walk-forward R^2 +0.072 (oldest 70%
+// fit, newest 30% tested) and +0.140 (50/50 split). Adding 7-day growth makes leave-one-out
+// worse (RMSE 2.115 against 2.107 size-only) and 5-fold CV worse (2.081 against 2.062), and
+// its walk-forward gain flips between splits, so growth weight is 0.00. Age loses
+// leave-one-out and 5-fold CV on the same age-known subset (1.997 against 1.986 size-only)
+// and fails walk-forward outright (R^2 -0.50 at 70/30; the 50/50 fit is singular — the
+// oldest-47 train has capped age constant at 730 days, collinear with the intercept, so no
+// fit exists), so the maturity multiplier is 1.00. Growth and age stay visible as per-row
+// columns, with the note that they were fitted and dropped on the blind tests.
+//
+// Reconciliation note: the previous version quoted the slope fitted on the age-known subset
+// only (n=95), not the all-peer fit. The all-128 fit is -0.48 and that is what radar-4 uses.
+// No protocol name is ever special-cased: the same function scores every row, and the peer
+// table, the size reference and the fitted exponent are recomputed or stated from whatever
+// snapshot the program is given.
 
 /** The snapshot's protocol entry: exactly the ten fields the sealed input carries. */
 export interface SnapshotProtocol {
@@ -81,18 +85,18 @@ export const MODEL: ModelConstants = {
   peer_min_count: 5,
   peer_floor: 0.01,
   peer_cap: 1.0,
-  size_exponent: -0.54,
-  growth_weight: 0.1,
+  size_exponent: -0.48,
+  growth_weight: 0,
   growth_floor: -50,
   growth_cap: 100,
-  maturity_floor: 0.9,
-  maturity_range: 0.1,
+  maturity_floor: 1.0,
+  maturity_range: 0,
   maturity_days: 730,
   unknown_age_days: 365,
 };
 
 /** The model's version label: the dashboard names it and the rules quote it. */
-export const MODEL_VERSION = 'radar-3';
+export const MODEL_VERSION = 'radar-4';
 
 /** How many live-token protocols the Live token view carries, by market cap. */
 export const LIVE_ROWS = 24;
@@ -127,6 +131,11 @@ export interface BoardRow {
   token_status: 'pre-token';
   age_days: number | null;
   implied_value_usd: number;
+  /** P(records a token) from the peers' record: display-only, never multiplied into implied value. */
+  token_record_odds: number;
+  /** The 80% conformal range around implied_value_usd, from the LOO residuals of the size fit. */
+  range_low_usd: number;
+  range_high_usd: number;
   model: {
     peer_multiple: number;
     peer_median: number;
@@ -154,6 +163,11 @@ export interface RadarRow {
   listed_at: string | null;
   age_days: number | null;
   implied_value_usd: number;
+  /** P(records a token) from the peers' record: display-only, never multiplied into implied value. */
+  token_record_odds: number;
+  /** The 80% conformal range around implied_value_usd, from the LOO residuals of the size fit. */
+  range_low_usd: number;
+  range_high_usd: number;
   peer_multiple: number;
   peer_median: number;
   size_multiplier: number;
@@ -174,6 +188,36 @@ export interface LiveRow {
   change_7d: number | null;
 }
 
+/** One protocol's disposition in the 758-protocol accounting: ranked, live-with-mcap, token-but-no-mcap, or excluded. */
+export type DispositionStatus = 'ranked' | 'live-with-mcap' | 'token-but-no-mcap' | 'excluded';
+
+/** One row of the 758-protocol disposition table: every snapshot protocol, exactly once. */
+export interface DispositionRow {
+  slug: string;
+  status: DispositionStatus;
+  exclude_reason: string | null;
+}
+
+/** The 758-protocol accounting, counted from the snapshot (never hardcoded). */
+export interface DispositionSummary {
+  total: number;
+  ranked: number;
+  excluded: number;
+  excluded_by_reason: Record<string, number>;
+  live_with_mcap: number;
+  token_but_no_mcap: number;
+  records_token: number;
+}
+
+/** The conformal half-widths (log points) of the size fit's LOO residuals, computed at build time. */
+export interface ConformalQuantiles {
+  q50: number;
+  q80: number;
+  q90: number;
+  loo_n: number;
+  residual_sd: number;
+}
+
 /** Everything the dashboard needs: the board, the live set, the peer table and the model it runs. */
 export interface RadarData {
   as_of: string;
@@ -191,6 +235,15 @@ export interface RadarData {
   peers: Record<string, PeerEntry>;
   rows: RadarRow[];
   live: LiveRow[];
+  /** Conformal half-widths (log points) so the page can draw the 50%/80%/90% ranges. */
+  conformal_q50: number;
+  conformal_q80: number;
+  conformal_q90: number;
+  conformal_loo_n: number;
+  conformal_residual_sd: number;
+  /** The 758-protocol accounting: every snapshot protocol, with its status. */
+  disposition: DispositionSummary;
+  dispositions: DispositionRow[];
 }
 
 /** Why the snapshot is not one this model can score. */
@@ -296,7 +349,7 @@ export function impliedValue(
   const maturityMult = model.maturity_floor + (Math.min(Math.max(ageForModel, 0), model.maturity_days) / model.maturity_days) * model.maturity_range;
   // The size term: the peer median is the multiple at the reference size, and the multiple
   // falls as TVL rises, at the fitted exponent. A protocol at the reference size is priced on
-  // the median as stated; a protocol ten times larger is priced at about 0.29x it.
+  // the median as stated; a protocol ten times larger is priced at about 0.33x it.
   const peerMedian = peer.multiple;
   const sizeMultiplier = sizeReferenceTvl > 0 ? Math.pow(protocol.tvl_usd / sizeReferenceTvl, model.size_exponent) : 1;
   const peerMultipleRaw = Math.min(model.peer_cap, Math.max(model.peer_floor, peerMedian * sizeMultiplier));
@@ -306,6 +359,114 @@ export function impliedValue(
   const base = protocol.tvl_usd * peerMultiple;
   const implied = Math.max(1, Math.round(base * growthMult * maturityMult));
   return { implied, peerMultiple, peerMedian, sizeMultiplier, growthPct, growthMult, maturityMult, age };
+}
+
+/**
+ * Token odds: P(records a token) from the peers' record — a logistic fit over all 758 snapshot
+ * protocols (y = 1 iff the protocol records a token: mcap, gecko_id or symbol non-null).
+ * 5-fold CV AUC 0.784; base rate 0.549; n = 758. Age is the signal (OR 1.85/yr); logTVL alone
+ * is nearly useless (CV AUC 0.524). This is a descriptive peer rate, NOT a prediction that
+ * this protocol will issue a token, or when: say "records a token", never "will launch" or
+ * "likely to launch". Display-only: never multiply it into implied_value_usd. Rows with no
+ * listed_at use the missing-age flag (OR 3.77) and display "age unknown" — the median age is
+ * never silently imputed. Growth's negative sign is a confound (young fast growers are
+ * pre-token); do not present it as "growth hurts launch chances".
+ * Coefficients: plain-stdlib logistic regression (IRLS, ridge 1.0) fitted on the snapshot;
+ * logTVL standardised by the snapshot's own mean/SD, age in years capped at 5, growth
+ * clipped to +-50 and scaled per 50 points, categories with n >= 30 as dummies (the rest pool
+ * into Other with coefficient 0).
+ */
+const TOKEN_ODDS = {
+  intercept: -1.230549788143625,
+  log_tvl_mean: 17.734672724700136,
+  log_tvl_sd: 1.8078139266078541,
+  median_age_years: 1.8547945205479452,
+  log_tvl: 0.22089176518120854,
+  age_years: 0.6138982205839114,
+  age_missing: 1.326530572617239,
+  growth: -0.811790148795509,
+  growth_missing: 0.33309111853629053,
+  category: {
+    Dexs: 0.9522438196239638,
+    'Liquid Staking': -0.5005099074303326,
+    Lending: 0.9757722198369126,
+    CEX: -1.8244841221817456,
+    Bridge: -0.46699640048684754,
+    'Risk Curators': -1.145572498379737,
+    Yield: 0.4640571069658003,
+    RWA: 0.1058015754209492,
+    'Canonical Bridge': -0.7482945325387886,
+  } as Record<string, number>,
+};
+
+/** The share of the snapshot's peers that record a token, for a protocol of this size, age and category. */
+export function tokenRecordOdds(protocol: SnapshotProtocol, asOf: string): number {
+  const age = ageDays(asOf, protocol.listed_at);
+  const logTvl = Math.log(Math.max(protocol.tvl_usd, 1));
+  const logTvlZ = (logTvl - TOKEN_ODDS.log_tvl_mean) / TOKEN_ODDS.log_tvl_sd;
+  const ageYears = age === null ? TOKEN_ODDS.median_age_years : Math.min(age, 1825) / 365;
+  const growth = protocol.change_7d === null ? 0 : Math.min(50, Math.max(-50, protocol.change_7d)) / 50;
+  let logit =
+    TOKEN_ODDS.intercept +
+    TOKEN_ODDS.log_tvl * logTvlZ +
+    TOKEN_ODDS.age_years * ageYears +
+    (age === null ? TOKEN_ODDS.age_missing : 0) +
+    TOKEN_ODDS.growth * growth +
+    (protocol.change_7d === null ? TOKEN_ODDS.growth_missing : 0) +
+    (TOKEN_ODDS.category[protocol.category ?? ''] ?? 0);
+  logit = Math.min(30, Math.max(-30, logit));
+  return 1 / (1 + Math.exp(-logit));
+}
+
+/** An OLS fit of y = a + b*x over points, via the normal equations (two parameters, exact). */
+function ols2(points: { x: number; y: number }[]): { intercept: number; slope: number } {
+  const n = points.length;
+  let sx = 0;
+  let sy = 0;
+  let sxx = 0;
+  let sxy = 0;
+  for (const p of points) {
+    sx += p.x;
+    sy += p.y;
+    sxx += p.x * p.x;
+    sxy += p.x * p.y;
+  }
+  const det = n * sxx - sx * sx;
+  const slope = (n * sxy - sx * sy) / det;
+  const intercept = (sy - slope * sx) / n;
+  return { intercept, slope };
+}
+
+/**
+ * Conformal half-widths from the leave-one-out residuals of the size (M1 log-ratio) fit:
+ * y = log(mcap/TVL) on log(TVL), over the snapshot's live-token peers with a positive ratio
+ * (n = 128 here). Deterministic brute-force refits, no randomness. The quantile is the
+ * conformal ceil((n+1)*q)/n-th order statistic of |residual|. Radar-3 reference values from
+ * the same residuals: q80 2.4383 -> [0.087x, 11.5x], q90 3.7293 -> [0.024x, 41.7x]; the
+ * values stored here are recomputed under radar-4 at build time. LOO residual SD ~2.11 log
+ * points; empirical coverage 0.812 at 80% / 0.914 at 90% under radar-3. One global interval:
+ * per-category intervals were tested and rejected (only 7 categories have >= 8 live
+ * positive-ratio peers; spreads unstable, e.g. Canonical Bridge q90 6.143 on n=8).
+ */
+export function conformalQuantiles(snapshot: Snapshot): ConformalQuantiles {
+  const points: { x: number; y: number }[] = [];
+  for (const p of snapshot.protocols) {
+    if (p.mcap_usd === null || p.tvl_usd <= 0) continue;
+    const ratio = p.mcap_usd / p.tvl_usd;
+    if (!Number.isFinite(ratio) || ratio <= 0) continue;
+    points.push({ x: Math.log(p.tvl_usd), y: Math.log(ratio) });
+  }
+  const n = points.length;
+  const residuals: number[] = [];
+  for (let i = 0; i < n; i++) {
+    const train = points.filter((_, j) => j !== i);
+    const { intercept, slope } = ols2(train);
+    residuals.push(points[i]!.y - (intercept + slope * points[i]!.x));
+  }
+  const absSorted = residuals.map(Math.abs).sort((a, b) => a - b);
+  const quant = (q: number): number => absSorted[Math.min(n, Math.ceil((n + 1) * q)) - 1]!;
+  const residualSd = Math.sqrt(residuals.reduce((s, e) => s + e * e, 0) / n);
+  return { q50: quant(0.5), q80: quant(0.8), q90: quant(0.9), loo_n: n, residual_sd: residualSd };
 }
 
 /** DefiLlama's version-marker rule: a name ending in a release is a pool of another protocol. */
@@ -340,6 +501,61 @@ export function isRankable(p: SnapshotProtocol): boolean {
   );
 }
 
+/**
+ * Why a pre-token protocol is excluded from the board, in the house rule's priority order:
+ * excluded-category first, then versioned-name, then wrapped/staked-word, then
+ * exchange-prefix. A protocol in two classes counts once, under the first reason.
+ */
+export function excludeReason(p: SnapshotProtocol): string | null {
+  if (EXCLUDED_CATEGORIES.has(p.category ?? '')) return 'excluded-category';
+  if (VERSIONED.test(p.name)) return 'versioned-name';
+  if (WRAPPED_WORD.test(p.name)) return 'wrapped/staked-word';
+  if (EXCHANGE_PREFIX.test(p.name)) return 'exchange-prefix';
+  return null;
+}
+
+/**
+ * The 758-protocol accounting: every snapshot protocol exactly once — ranked (the board),
+ * excluded pre-token (with its reason), live-with-mcap (records a token and has a market
+ * cap), or token-but-no-mcap (records a token but DefiLlama carries no market cap for it).
+ * Counts are computed from the snapshot, never hardcoded.
+ */
+export function buildDispositions(snapshot: Snapshot): { summary: DispositionSummary; rows: DispositionRow[] } {
+  const rows: DispositionRow[] = [];
+  const summary: DispositionSummary = {
+    total: snapshot.protocols.length,
+    ranked: 0,
+    excluded: 0,
+    excluded_by_reason: {},
+    live_with_mcap: 0,
+    token_but_no_mcap: 0,
+    records_token: 0,
+  };
+  for (const p of snapshot.protocols) {
+    if (isPreToken(p)) {
+      if (isRankable(p)) {
+        rows.push({ slug: p.slug, status: 'ranked', exclude_reason: null });
+        summary.ranked++;
+      } else {
+        const reason = excludeReason(p) ?? 'other';
+        rows.push({ slug: p.slug, status: 'excluded', exclude_reason: reason });
+        summary.excluded++;
+        summary.excluded_by_reason[reason] = (summary.excluded_by_reason[reason] ?? 0) + 1;
+      }
+    } else {
+      summary.records_token++;
+      if (p.mcap_usd !== null) {
+        rows.push({ slug: p.slug, status: 'live-with-mcap', exclude_reason: null });
+        summary.live_with_mcap++;
+      } else {
+        rows.push({ slug: p.slug, status: 'token-but-no-mcap', exclude_reason: null });
+        summary.token_but_no_mcap++;
+      }
+    }
+  }
+  return { summary, rows };
+}
+
 /** The snapshot's protocol by slug. */
 function bySlug(protocols: SnapshotProtocol[]): Map<string, SnapshotProtocol> {
   return new Map(protocols.map((p) => [p.slug, p]));
@@ -356,6 +572,7 @@ export interface BoardSummary {
 /** The protocols the board ranks, strongest first, with ranks 1..n. */
 export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): BoardRow[] {
   const { table, overall, sizeReferenceTvl } = peerTable(snapshot, model);
+  const { q80 } = conformalQuantiles(snapshot);
   const index = bySlug(snapshot.protocols);
   const chosen = new Map<string, SnapshotProtocol>();
   // The watchlist is the floor: every slug, even one the snapshot no longer carries (it cannot, but the
@@ -391,6 +608,7 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
       growthMult,
       maturityMult,
       age,
+      odds: round4(tokenRecordOdds(p, snapshot.as_of)),
     };
   });
   scored.sort((a, b) => b.implied - a.implied || (a.p.slug < b.p.slug ? -1 : a.p.slug > b.p.slug ? 1 : 0));
@@ -409,6 +627,9 @@ export function buildBoard(snapshot: Snapshot, model: ModelConstants = MODEL): B
     token_status: 'pre-token',
     age_days: s.age,
     implied_value_usd: s.implied,
+    token_record_odds: s.odds,
+    range_low_usd: Math.max(1, Math.round(s.implied * Math.exp(-q80))),
+    range_high_usd: Math.round(s.implied * Math.exp(q80)),
     model: {
       peer_multiple: round4(s.peer.multiple),
       peer_median: s.peerMedian,
@@ -618,6 +839,9 @@ export function radarRow(row: BoardRow): RadarRow {
     listed_at: row.listed_at,
     age_days: row.age_days,
     implied_value_usd: row.implied_value_usd,
+    token_record_odds: row.token_record_odds,
+    range_low_usd: row.range_low_usd,
+    range_high_usd: row.range_high_usd,
     peer_multiple: row.model.peer_multiple,
     peer_median: row.model.peer_median,
     size_multiplier: row.model.size_multiplier,
@@ -633,6 +857,8 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
   const board = buildBoard(snapshot, model);
   const live = liveRows(snapshot);
   const { table, overall, sizeReferenceTvl } = peerTable(snapshot, model);
+  const conformal = conformalQuantiles(snapshot);
+  const { summary: disposition, rows: dispositions } = buildDispositions(snapshot);
   const early = board.filter((r) => !snapshot.watchlist.includes(r.slug)).length;
   const radar: RadarData = {
     as_of: snapshot.as_of,
@@ -650,6 +876,13 @@ export function buildRadar(snapshot: Snapshot, model: ModelConstants = MODEL): {
     peers: table,
     rows: board.map(radarRow),
     live,
+    conformal_q50: round4(conformal.q50),
+    conformal_q80: round4(conformal.q80),
+    conformal_q90: round4(conformal.q90),
+    conformal_loo_n: conformal.loo_n,
+    conformal_residual_sd: round4(conformal.residual_sd),
+    disposition,
+    dispositions,
   };
   return { board, radar };
 }
