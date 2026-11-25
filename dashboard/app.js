@@ -578,10 +578,14 @@
     DATA.rows.slice(0, 20).forEach(function (r) { if (r.category === 'Basis Trading') basisTop++; });
     var catsUnder5 = Object.keys(DATA.peers).filter(function (k) { return DATA.peers[k].n < 5; }).length;
     var catsTotal = Object.keys(DATA.peers).length;
+    var sc = buildSelfChecks();
+    var scPassed = 0; for (var i=0;i<sc.length;i++) if (sc[i][2]===true) scPassed++;
+    var V={Farm:0,Thin:0,Check:0}; DATA.rows.forEach(function(r){var v=farmVerdict(r);V[v.verdict==="Check first"?"Check":v.verdict]++;});
     mount.innerHTML = '<div class="shell">' +
       '<header class="top"><div class="brand"><span class="mark" aria-hidden="true"></span>Token Radar</div>' +
       '<div class="top-meta"><span>Snapshot ' + esc(DATA.as_of) + '</span><span>Model ' + esc(DATA.model_version) + '</span><span>' + DATA.board_size + ' rows</span></div></header>' +
       '<div class="kpi">' + (DATA.disposition ? DATA.disposition.total : 758) + ' protocols accounted for · ' + DATA.board_size + ' ranked · watchlist ' + wlCount + '/' + DATA.watchlist_size + ' · board total ' + fmtExact(boardTotal) + ' · size ' + MODEL.size_exponent.toFixed(2) + ' · LOO ×1.09 · odds AUC 0.78</div>' +
+      '<div class="panel model" aria-label="Self-check" style="margin:0;padding:2px 8px;background:var(--panel);border:1px solid #6b5416;border-radius:var(--radius);text-align:center;font-size:11px;font-weight:600;line-height:1.1;color:var(--text);">Self-check ✓ ' + scPassed + '/' + sc.length + ' · Farm ' + V.Farm + ' / Check first ' + V.Check + ' / Thin ' + V.Thin + '</div>' +
       '<section class="lede"><h1>The protocols with no token yet, ranked by what a launch would be worth</h1>' +
       '<p>One sealed DefiLlama snapshot, ' + DATA.board_size + ' pre-token protocols, each priced like its live-token peers, adjusted for size: the bigger the protocol, the lower the multiple the market pays. The watchlist is the floor, never the ceiling: every watchlist protocol is here, and so is every other pre-token protocol the rule would rank. Click a row for the model behind its number and a plan to farm it.</p>' +
       '<div class="facts">' +
