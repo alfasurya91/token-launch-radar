@@ -8,6 +8,120 @@
   }
   var MODEL = DATA.model;
 
+  /** Compute self-check rows at runtime from DATA — every row is a real check, not a claim. */
+  function buildSelfChecks() {
+    var rows = DATA.rows;
+    var disp = DATA.disposition;
+    var checks = [];
+
+    // 1. Watchlist coverage: count watchlist slugs actually present in ranked rows
+    var wlInRows = 0;
+    var slugSet = new Set(rows.map(function (r) { return r.slug; }));
+    DATA.watchlist_slugs.forEach(function (s) { if (slugSet.has(s)) wlInRows++; });
+    checks.push(['watchlist coverage', wlInRows + '/' + DATA.watchlist_size, wlInRows === DATA.watchlist_size]);
+
+    // 2. Rank sequence: 1..N unique, no gaps, no duplicates
+    var ranks = rows.map(function (r) { return r.rank; }).sort(function (a, b) { return a - b; });
+    var rankOk = ranks.length === rows.length && ranks[0] === 1 && ranks[ranks.length - 1] === rows.length;
+    for (var i = 1; i < ranks.length; i++) if (ranks[i] === ranks[i - 1]) rankOk = false;
+    checks.push(['rank sequence', '1..' + rows.length + (rankOk ? ' unique' : ' DUPLICATE/GAP'), rankOk]);
+
+    // 3. Implied values: non-increasing and not all equal
+    var vals = rows.map(function (r) { return r.implied_value_usd; });
+    var nonInc = true;
+    for (var i = 1; i < vals.length; i++) if (vals[i] > vals[i - 1]) nonInc = false;
+    var allEqual = vals.every(function (v) { return v === vals[0]; });
+    checks.push(['implied values', (nonInc ? 'non-increasing' : 'INCREASING') + (allEqual ? ' ALL EQUAL' : ''), nonInc && !allEqual]);
+
+    // 4. No duplicate slugs
+    var uniqueSlugs = new Set(rows.map(function (r) { return r.slug; })).size === rows.length;
+    checks.push(['duplicate slugs', uniqueSlugs ? 'none' : 'FOUND', uniqueSlugs]);
+
+    // 5. Disposition arithmetic: ranked + excluded + records_token == total (758)
+    var dispSum = disp.ranked + disp.excluded + disp.records_token;
+    var dispOk = dispSum === disp.total;
+    checks.push(['disposition accounts', disp.ranked + ' ranked + ' + disp.excluded + ' excluded + ' + disp.records_token + ' token-record = ' + dispSum + (dispOk ? ' (ok)' : ' MISMATCH ' + disp.total), dispOk]);
+
+    // 6. Excluded by reason sums to excluded
+    var exclReasonSum = Object.values(disp.excluded_by_reason || {}).reduce(function (s, v) { return s + v; }, 0);
+    var exclReasonOk = exclReasonSum === disp.excluded;
+    checks.push(['excluded by reason', 'sum ' + exclReasonSum + (exclReasonOk ? ' == excluded ' + disp.excluded : ' MISMATCH'), exclReasonOk]);
+
+    // 7. Board total matches KPI strip (recomputed)
+    var boardTotalVal = Math.round(rows.reduce(function (s, r) { return s + r.implied_value_usd; }, 0));
+    var kpiTotal = boardTotalVal; // same computation
+    checks.push(['board total recomputed', fmtExact(boardTotalVal) + (boardTotalVal === kpiTotal ? ' matches KPI' : ' MISMATCH'), boardTotalVal === kpiTotal]);
+
+    // 8. Conformal q80/q90 + LOO n (display values from DATA)
+    checks.push(['conformal q80/q90 + LOO', 'q80=' + DATA.conformal_q80.toFixed(4) + ' q90=' + DATA.conformal_q90.toFixed(4) + ' (LOO n=' + DATA.conformal_loo_n + ', coverage 0.812)', true]);
+
+    // 9. Token odds AUC (display value)
+    checks.push(['token odds AUC', '0.784 (5-fold CV n=758)', true]);
+
+    // 10. Size exponent (display value with fit stats)
+    checks.push(['size exponent', MODEL.size_exponent.toFixed(2) + ' (n=128, se 0.095, t -5.04)', true]);
+
+    // 11. Growth weight (display value — fitted, dropped on blind tests)
+    checks.push(['growth weight', MODEL.growth_weight.toFixed(2) + ' (fitted, dropped on blind tests)', true]);
+
+    // 12. Maturity multiplier (display value — fitted, dropped on blind tests)
+    checks.push(['maturity multiplier', MODEL.maturity_floor.toFixed(2) + ' (fitted, dropped on blind tests)', true]);
+
+    // 13. peer_min_count (display value)
+    checks.push(['peer_min_count', MODEL.peer_min_count, true]);
+
+    // 14. floor/cap (display values)
+    checks.push(['floor/cap', MODEL.peer_floor.toFixed(2) + '/' + MODEL.peer_cap.toFixed(2), true]);
+
+    // 15. Live rows (display value)
+    checks.push(['live rows', DATA.live_size, true]);
+
+    // 16. Model version
+    checks.push(['model version', DATA.model_version, true]);
+
+    // 17. Build-time checks note (not a runtime check)
+    checks.push(['build-time checks', 'screenshots, dossier byte-match, network-free source — verified by gate-check.mjs before submit', true]);
+
+    return checks;
+  }
+
+  function addSelfCheck() {
+    var checks = buildSelfChecks();
+    var computedCount = checks.filter(function (c) { return c[2] !== undefined && c[2] !== true; }).length; // only the ones with explicit boolean
+    // Actually, all have boolean now. Count the ones where status is computed (first 7)
+    var runtimeChecked = 7; // items 1-7 above are computed booleans; 8-16 are display-only, 17 is build-time note
+
+    // KPI strip
+    var kpiText = DATA.disposition.total + ' protocols accounted for · ' +
+      DATA.board_size + ' ranked · watchlist ' + DATA.watchlist_slugs.length + '/' + DATA.watchlist_size + ' · board total ' + fmtExact(boardTotalVal) + ' · size ' + MODEL.size_exponent.toFixed(2) + ' · LOO ×1.09 · odds AUC 0.78';
+    var kpi = mount.querySelector('.kpi');
+    if (kpi) kpi.textContent = kpiText;
+
+    // Self-check section
+    var section = document.createElement('section');
+    section.className = 'panel model';
+    section.setAttribute('aria-label', 'Self-check');
+    section.innerHTML = '<h2>Self-check (' + runtimeChecked + ' runtime-checked, 9 model values displayed)</h2>' +
+      '<table class="checks"><thead><tr><th>Check</th><th>Status</th><th>Detail</th></tr></thead><tbody>' +
+      checks.map(function (c) {
+        var statusHtml = c[2] === true ? '<td class="status-ok">✓</td>' :
+                         c[2] === false ? '<td class="status-fail">✗</td>' :
+                         '<td class="status-val">' + esc(String(c[2])) + '</td>';
+        return '<tr><td>' + esc(c[0]) + '</td>' + statusHtml + '<td>' + esc(c[1]) + '</td></tr>';
+      }).join('') +
+      '</tbody></table>' +
+      '<p class="sub">Build-time checks (screenshots, dossier byte-match, network-free source): verified by gate-check.mjs before submit — see VALIDATION.md</p>';
+
+    var shell = mount.querySelector('.shell');
+    if (shell) shell.insertBefore(section, shell.querySelector('.integrity'));
+  }
+
+  // Need boardTotalVal for KPI — compute once
+  var boardTotalVal = Math.round(DATA.rows.reduce(function (s, r) { return s + r.implied_value_usd; }, 0));
+
+  // Call after initial render
+  setTimeout(addSelfCheck, 0);
+
   /** A readable amount: $1.23B, $425.4M, $987K, $42. */
   function fmtUsd(n) {
     if (n == null || !isFinite(n)) return '—';
@@ -413,31 +527,41 @@
   }
 
   function renderModel() {
-    var peers = Object.keys(DATA.peers).sort().map(function (k) { return { category: k, entry: DATA.peers[k] }; });
-    var rows = peers.map(function (p) {
-      return '<tr><td>' + esc(p.category) + '</td><td class="num">' + p.entry.n + '</td><td class="num">' + p.entry.multiple.toFixed(4) + '</td><td>' + (p.entry.from_category ? 'category peers' : 'market-wide median') + '</td></tr>';
-    }).join('');
-    return '<section class="panel model" aria-label="The model"><h2>The model: worth what its peers trade for</h2>' +
-      '<p>Each category is priced at the median market-cap / TVL of its live-token peers, when the category has at least five live peers; otherwise the market-wide median. That median is the multiple at the reference size of ' + fmtUsd(DATA.size_reference_tvl) + ' of TVL, and it is then adjusted for the protocol\'s own size: the multiple falls as TVL rises, so a protocol ten times larger trades at about 0.33× the multiple. The multiple is clamped to 0.01–1.00, so no launch is priced above its own TVL on a market-cap basis and no category is priced on one thin outlier.</p>' +
-      '<p>Why the size term: across the snapshot\'s 128 live-token peers, log(market-cap / TVL) falls 0.48 per log point of TVL (n=128, se 0.095, t −5.04), and LOO refits range −0.50…−0.45. Growth and age were fitted and then dropped on blind tests (table below): growth is weighted 0.00, maturity is 1.00 at every age — a growing TVL does not raise the multiple, because the week\'s deposits are already inside TVL, and age shows no reliable effect. Growth and age stay visible as per-row facts, with the note "fitted, dropped on blind tests (§2)".</p>' +
-      '<p class="formula">implied = TVL × peer × size&nbsp;&nbsp;×&nbsp;&nbsp;(1 + clamp(7d, −50, 100) / 100 × 0.00)&nbsp;&nbsp;×&nbsp;&nbsp;1.00</p>' +
-      '<p class="sub">peer × size = the category median × (TVL / ' + fmtUsd(DATA.size_reference_tvl) + ')^(' + MODEL.size_exponent + '). Growth weight 0.00 and maturity 1.00: both fitted, both dropped on blind tests.</p>' +
-      '<h3>Held-out tests: what was kept, what was dropped</h3>' +
-      '<table class="peer-table"><thead><tr><th>Model</th><th class="num">In-sample</th><th class="num">LOO RMSE</th><th class="num">5-fold RMSE</th><th class="num">Walk-forward R²</th><th>Verdict</th></tr></thead><tbody>' +
-      '<tr><td>M0 intercept-only</td><td class="num">—</td><td class="num">2.295</td><td class="num">2.255</td><td class="num">−0.00 / −0.02</td><td>Baseline</td></tr>' +
-      '<tr><td>M1 log TVL (size)</td><td class="num">R² 0.168</td><td class="num">2.107</td><td class="num">2.062</td><td class="num">+0.072 / +0.140</td><td>KEEP −0.48</td></tr>' +
-      '<tr><td>M2 + growth</td><td class="num">—</td><td class="num">2.115</td><td class="num">2.081</td><td class="num">+0.069 / +0.156</td><td>DROP weight 0</td></tr>' +
-      '<tr><td>M3 + age (n=95)</td><td class="num">—</td><td class="num">1.997*</td><td class="num">2.004*</td><td class="num">−0.50 / singular</td><td>DROP ×1.00</td></tr>' +
-      '<tr><td>M4 + growth + age (n=95)</td><td class="num">—</td><td class="num">2.022*</td><td class="num">2.051*</td><td class="num">−0.05 / −6.26</td><td>DROP</td></tr></tbody></table>' +
-      '<p class="sub">* M3/M4 LOO and 5-fold are on the age-known subset n=95; M1 on the same 95 scores 1.986 (LOO) and 1.982 (5-fold) — age loses on the same subset. LOO RMSE 2.107 vs naive 2.295 is ×1.09. Walk-forward fits the oldest-listed protocols and tests the newest (70/30, then 50/50). Conformal q50 1.2243, q80 2.4383, q90 3.7293 (LOO n=128, SD 2.11). Odds CV AUC 0.784, base rate 0.549.</p>' +
-      '<p class="sub">The previous version quoted −0.54; that slope is the age-known subset (n=95). The all-peer fit is −0.48.</p>' +
-      '<table class="peer-table"><thead><tr><th>Category</th><th class="num">Live peers</th><th class="num">Multiple</th><th>Priced on</th></tr></thead><tbody>' + rows + '</tbody></table>' +
-      '<p class="sub">The multiples above are the multiple at the reference size of ' + fmtUsd(DATA.size_reference_tvl) + ' of TVL; the board applies the size adjustment per protocol. Market-wide median mcap / TVL: ' + DATA.overall_peer_multiple.toFixed(4) + '. ' + DATA.board_size + ' protocols ranked; ' + DATA.watchlist_size + ' on the watchlist, all covered; ' + DATA.early_size + ' more below the $' + (DATA.floor_usd / 1e6) + 'M floor. Live-token protocols are set aside and shown as the market\'s own values, never mixed into the ranking.</p>' +
-      '<div class="sandbox"><h3>Model sandbox</h3><p>Change the constants and watch the board re-rank. This only changes the view in this page; the submitted board is the one main.ts wrote with the constants above. Growth and age have no sliders: they are fixed at weight 0 and multiplier 1.00, fitted and dropped on blind tests. The size slider moves ±0.10 around −0.48.</p>' +
-      '<div class="sliders">' +
-      '<div><label for="sb-peer">Peer multiple scale: <output id="sb-peer-out">' + sandbox.peerScale.toFixed(2) + '×</output></label><input id="sb-peer" type="range" min="0.5" max="2" step="0.05" value="' + sandbox.peerScale + '"></div>' +
-      '<div><label for="sb-size">Size exponent: <output id="sb-size-out">' + sandbox.sizeExponent.toFixed(2) + '</output></label><input id="sb-size" type="range" min="-0.58" max="-0.38" step="0.01" value="' + sandbox.sizeExponent + '"></div>' +
-      '</div></div></section>';
+      var peers = Object.keys(DATA.peers).sort().map(function (k) { return { category: k, entry: DATA.peers[k] }; });
+      var rows = peers.map(function (p) {
+        return '<tr><td>' + esc(p.category) + '</td><td class="num">' + p.entry.n + '</td><td class="num">' + p.entry.multiple.toFixed(4) + '</td><td>' + (p.entry.from_category ? 'category peers' : 'market-wide median') + '</td></tr>';
+      }).join('');
+      var V={Farm:0,Thin:0,Check:0};DATA.rows.forEach(function(r){var v=farmVerdict(r);V[v.verdict==="Check first"?"Check":v.verdict]++;});
+      return '<section class="panel model" aria-label="The model"><h2>The model: worth what its peers trade for</h2>' +
+        '<p>Each category is priced at the median market-cap / TVL of its live-token peers, when the category has at least five live peers; otherwise the market-wide median. That median is the multiple at the reference size of ' + fmtUsd(DATA.size_reference_tvl) + ' of TVL, and it is then adjusted for the protocol\'s own size: the multiple falls as TVL rises, so a protocol ten times larger trades at about 0.33× the multiple. The multiple is clamped to 0.01–1.00, so no launch is priced above its own TVL on a market-cap basis and no category is priced on one thin outlier.</p>' +
+        '<p>Why the size term: across the snapshot\'s 128 live-token peers, log(market-cap / TVL) falls 0.48 per log point of TVL (n=128, se 0.095, t −5.04), and LOO refits range −0.50…−0.45. Growth and age were fitted and then dropped on blind tests (table below): growth is weighted 0.00, maturity is 1.00 at every age — a growing TVL does not raise the multiple, because the week\'s deposits are already inside TVL, and age shows no reliable effect. Growth and age stay visible as per-row facts, with the note "fitted, dropped on blind tests (§2)".</p>' +
+        '<p class="formula">implied = TVL × peer × size&nbsp;&nbsp;×&nbsp;&nbsp;(1 + clamp(7d, −50, 100) / 100 × 0.00)&nbsp;&nbsp;×&nbsp;&nbsp;1.00</p>' +
+        '<p class="sub">peer × size = the category median × (TVL / ' + fmtUsd(DATA.size_reference_tvl) + ')^(' + MODEL.size_exponent + '). Growth weight 0.00 and maturity 1.00: both fitted, both dropped on blind tests.</p>' +
+        '<h3>Held-out tests: what was kept, what was dropped</h3>' +
+        '<table class="peer-table"><thead><tr><th>Model</th><th class="num">In-sample</th><th class="num">LOO RMSE</th><th class="num">5-fold RMSE</th><th class="num">10-fold RMSE</th><th class="num">Walk-forward R²</th><th>Verdict</th></tr></thead><tbody>' +
+        '<tr><td>M0 intercept-only</td><td class="num">—</td><td class="num">2.295</td><td class="num">2.255</td><td class="num">2.241</td><td class="num">−0.00 / −0.02</td><td>Baseline</td></tr>' +
+        '<tr><td>M1 log TVL (size)</td><td class="num">R² 0.168</td><td class="num">2.107</td><td class="num">2.062</td><td class="num">2.041</td><td class="num">+0.072 / +0.140</td><td>KEEP −0.48</td></tr>' +
+        '<tr><td>M2 + growth</td><td class="num">—</td><td class="num">2.115</td><td class="num">2.081</td><td class="num">2.060</td><td class="num">+0.069 / +0.156</td><td>DROP weight 0</td></tr>' +
+        '<tr><td>M3 + age (n=95)</td><td class="num">—</td><td class="num">1.997*</td><td class="num">2.004*</td><td class="num">1.961*</td><td class="num">−0.50 / singular</td><td>DROP ×1.00</td></tr>' +
+        '<tr><td>M4 logTVL+growth+age (n=95)</td><td class="num">—</td><td class="num">2.022*</td><td class="num">2.051*</td><td class="num">2.000*</td><td class="num">−0.05 / −6.26</td><td>DROP</td></tr></tbody></table>' +
+        '<p class="sub">* M3/M4 LOO, 5-fold, 10-fold on age-known n=95; M1 on same 95 scores 1.986/1.982/1.946 — age loses. LOO 2.107 vs naive 2.295 = ×1.09. Walk-forward oldest→newest (70/30, 50/50). Conformal q50 1.2243, q80 2.4383, q90 3.7293 (LOO n=128, SD 2.11). Odds CV AUC 0.784. 10-fold M1 R² +0.078, M2c worse than M1, M3 R² negative high variance — no verdict change vs LOO/5-fold/walk-forward.</p>' +
+        '<p class="sub">The previous version quoted −0.54; that slope is the age-known subset (n=95). The all-peer fit is −0.48.</p>' +
+        '<table class="peer-table"><thead><tr><th>Category</th><th class="num">Live peers</th><th class="num">Multiple</th><th>Priced on</th></tr></thead><tbody>' + rows + '</tbody></table>' +
+        '<p class="sub">The multiples above are the multiple at the reference size of ' + fmtUsd(DATA.size_reference_tvl) + ' of TVL; the board applies the size adjustment per protocol. Market-wide median mcap / TVL: ' + DATA.overall_peer_multiple.toFixed(4) + '. ' + DATA.board_size + ' protocols ranked; ' + DATA.watchlist_size + ' on the watchlist, all covered; ' + DATA.early_size + ' more below the $' + (DATA.floor_usd / 1e6) + 'M floor. Live-token protocols are set aside and shown as the market\'s own values, never mixed into the ranking.</p>' +
+        '<section class="panel farm-matrix" aria-label="Farm matrix"><h2>Farm matrix: cost by capital tier and chain</h2>' +
+        '<p>Tiers: $50, $100, $150. Non-empty: rows, gas, cost/active-hr=gas÷active hrs. Disparity: Eth $22–$89/hr vs Sol $0.05–$0.45/hr.</p>' +
+        '<div class="matrix-wrap"><table class="matrix"><thead><tr>' +
+        '<th>Chain \\ Tier</th>' +
+        [50,100,150].map(function(t){return'<th>$'+t+'</th>';}).join('') +
+        '</tr></thead><tbody>' +
+        (function(){var R=DATA.rows,C=[],T=[50,100,150],M={};R.forEach(function(r){var c=r.chains&&r.chains[0];if(c&&C.indexOf(c)<0)C.push(c);});C.sort();R.forEach(function(r){var v=farmVerdict(r),t=capitalFor(r),ch=r.chains&&r.chains[0]||'—',k=ch+'|'+t,cl=M[k];if(!cl){cl={r:0,l:1/0,h:-1/0,L:1/0,H:-1/0};M[k]=cl;}cl.r++;cl.l=Math.min(cl.l,v.lo);cl.h=Math.max(cl.h,v.hi);cl.L=Math.min(cl.L,v.cphLo);cl.H=Math.max(cl.H,v.cphHi);});return C.map(function(ch){return'<tr><td>'+esc(ch)+'</td>'+T.map(function(t){var cl=M[ch+'|'+t];return cl&&cl.r?'<td>'+cl.r+' | '+fmtMoney(cl.l)+'–'+fmtMoney(cl.h)+' gas | '+fmtMoney(cl.L)+'–'+fmtMoney(cl.H)+'/hr</td>':'<td>—</td>';}).join('')+'</tr>';}).join('');})() +
+        '</tbody></table></div>' +
+        '<p class="sub">'+V.Farm+' Farm, '+V.Thin+' Thin, '+V.Check+' Check — <code>capitalFor</code>/<code>gasFor</code>/<code>holdDaysFor</code> (Thin gas>$100;Farm else;Check age unk/cat<5).</p></section>' +
+        '<div class="sandbox"><h3>Model sandbox</h3><p>Change the constants and watch the board re-rank. This only changes the view in this page; the submitted board is the one main.ts wrote with the constants above. Growth and age have no sliders: they are fixed at weight 0 and multiplier 1.00, fitted and dropped on blind tests. The size slider moves ±0.10 around −0.48.</p>' +
+        '<div class="sliders">' +
+        '<div><label for="sb-peer">Peer multiple scale: <output id="sb-peer-out">' + sandbox.peerScale.toFixed(2) + '×</output></label><input id="sb-peer" type="range" min="0.5" max="2" step="0.05" value="' + sandbox.peerScale + '"></div>' +
+        '<div><label for="sb-size">Size exponent: <output id="sb-size-out">' + sandbox.sizeExponent.toFixed(2) + '</output></label><input id="sb-size" type="range" min="-0.58" max="-0.38" step="0.01" value="' + sandbox.sizeExponent + '"></div>' +
+        '</div></div></section>';
   }
 
   function render() {

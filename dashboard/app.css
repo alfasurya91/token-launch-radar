@@ -1,4 +1,8 @@
-/* Token Radar dashboard: dark slate, one amber accent, no framework, no network. */
+/* Self-check table styles */
+.checks { width: 100%; margin: 0 0 12px; }
+.checks th { text-align: left; font-size: 12px; text-transform: uppercase; letter-spacing: .4px; color: var(--muted); border-bottom: 1px solid var(--line); padding: 6px 8px; }
+.checks td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-align: top; }
+.checks .status-ok { color: var(--green); font-weight: bold; text-align: center; }
 :root {
   --bg: #0b1220;
   --panel: #101b2e;
